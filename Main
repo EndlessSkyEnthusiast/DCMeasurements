@@ -18,6 +18,8 @@ import matplotlib.pyplot as plt
 import threading
 import datetime
 import timeout_decorator
+from dataclasses import dataclass
+from functools import partial
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from keithley2600 import  ResultTable
 from matplotlib.animation import FuncAnimation
@@ -553,16 +555,23 @@ def _generate_coil_setpoints_linear_center_out_uA(coil_max_mA: float, step_mA: f
             out.append(v); seen.add(key)
     return out
 
+def _order_center_out_keyfun(x, start_uA):
+    return (abs(x - start_uA), 0 if (x - start_uA) >= 0 else 1)
+
 def _order_center_out_around_start(uA_points, start_mA):
     """Reihenfolge center-out um Startstrom (mA). Startpunkt zuerst, dann zunehmend entfernte Punkte."""
     start_uA = float(start_mA) * 1000.0
     uniq = sorted(set(float(x) for x in uA_points))
     if start_uA not in uniq:
         uniq.append(start_uA); uniq = sorted(uniq)
-    def keyfun(x):
-        return (abs(x - start_uA), 0 if (x - start_uA) >= 0 else 1)
-    ordered = sorted(uniq, key=keyfun)
+    ordered = sorted(uniq, key=partial(_order_center_out_keyfun, start_uA=start_uA))
     return ordered
+
+def _append_unique_value(seq, seen, v, max_uA):
+    key = round(float(v), 9)
+    if abs(v) <= max_uA + 1e-9 and key not in seen:
+        seq.append(float(v))
+        seen.add(key)
 
 # ---- Temperature/ADR guard (inkl. settle) ----
 def wait_for_temperature_settle(start_temp, s, *, label_prefix="PAUSE"):
@@ -762,6 +771,17 @@ except NameError:
 try:
     _find_extrema_centered
 except NameError:
+    def _extrema_prominent(idxs, y, thr, invert=False):
+        keep = []
+        for idx in idxs:
+            val = y[idx]
+            left = y[max(0, idx-1)]
+            right = y[min(len(y)-1, idx+1)]
+            prom = (val - min(left, right)) if not invert else (max(left, right) - val)
+            if prom >= thr:
+                keep.append(idx)
+        return keep
+
     def _find_extrema_centered(x, y, min_prom_rel=0.05):
         x = np.asarray(x, float); y = np.asarray(y, float)
         if len(x) < 5: return [], []
@@ -773,16 +793,8 @@ except NameError:
         if len(y) > 0:
             yr = max(1e-12, (np.nanmax(y) - np.nanmin(y)))
             thr = float(min_prom_rel) * yr
-            def prominent(idxs, invert=False):
-                keep = []
-                for idx in idxs:
-                    val = y[idx]
-                    left = y[max(0, idx-1)]; right = y[min(len(y)-1, idx+1)]
-                    prom = (val - min(left, right)) if not invert else (max(left, right) - val)
-                    if prom >= thr: keep.append(idx)
-                return keep
-            maxs = prominent(maxs, invert=False)
-            mins = prominent(mins, invert=True)
+            maxs = _extrema_prominent(maxs, y, thr, invert=False)
+            mins = _extrema_prominent(mins, y, thr, invert=True)
         return mins, maxs
 
 try:
@@ -1002,6 +1014,14 @@ def _confirm_switch_same_I(sign, IuA, pulse_width_s, pulse_settle_s, cooldown_s,
             hits += 1
     return (hits >= int(accept_min))
 
+def _guided_pulse(sign, IuA, pulse_width_s, pulse_settle_s, cooldown_s, collect_iv, iv, stop_event):
+    if stop_event and stop_event.is_set():
+        return None
+    v = _junction_pulse_measure_v(sign * IuA, pulse_width_s, pulse_settle_s, cooldown_s)
+    if collect_iv:
+        iv.append((sign * IuA, v))
+    return v
+
 
 def _find_ic_uA_guided(
     v_thresh, start_uA, growth, max_uA, refine_bits,
@@ -1026,19 +1046,13 @@ def _find_ic_uA_guided(
     hi_cap    = min(max_uA,  prev_mag * (1.0 + float(window_frac)))
     step_uA   = max(min_step_uA, prev_mag * float(step_rel))
 
-    def pulse(IuA):
-        if stop_event and stop_event.is_set(): return None
-        v = _junction_pulse_measure_v(sign * IuA, pulse_width_s, pulse_settle_s, cooldown_s)
-        if collect_iv: iv.append((sign * IuA, v))
-        return v
-
-    v0 = pulse(low_start)
+    v0 = _guided_pulse(sign, low_start, pulse_width_s, pulse_settle_s, cooldown_s, collect_iv, iv, stop_event)
     if v0 is None: return (sign * low_start, True, iv)
 
     if abs(v0) >= v_thresh:
         last_bad = low_start; cur = max(start_uA, low_start * (1.0 - step_rel)); last_ok = None
         for _ in range(200):
-            v = pulse(cur)
+            v = _guided_pulse(sign, cur, pulse_width_s, pulse_settle_s, cooldown_s, collect_iv, iv, stop_event)
             if v is None: return (sign * (last_ok if last_ok else cur), True, iv)
             if abs(v) < v_thresh: last_ok = cur; break
             last_bad = cur; cur = max(start_uA, cur * (1.0 - step_rel))
@@ -1048,7 +1062,7 @@ def _find_ic_uA_guided(
         last_ok = low_start; last_bad = None; cur = low_start + step_uA; consec_over = 0
         for _ in range(2000):
             if cur > hi_cap: break
-            v = pulse(cur)
+            v = _guided_pulse(sign, cur, pulse_width_s, pulse_settle_s, cooldown_s, collect_iv, iv, stop_event)
             if v is None: return (sign * last_ok, True, iv)
 
             confirm_extra      = int(DEFAULTS.get("confirm_extra_pulses", 2))
@@ -1077,7 +1091,7 @@ def _find_ic_uA_guided(
         # Expand, falls noch kein last_bad
         expand_rounds = 0; cur_hi = max(low_start + step_uA, last_ok + step_uA)
         while last_bad is None and cur_hi <= max_uA and expand_rounds < 10:
-            v = pulse(cur_hi)
+            v = _guided_pulse(sign, cur_hi, pulse_width_s, pulse_settle_s, cooldown_s, collect_iv, iv, stop_event)
             if v is None: return (sign * last_ok, True, iv)
             if np.isfinite(v) and abs(v) >= v_thresh:
                 confirm_extra      = int(DEFAULTS.get("confirm_extra_pulses", 2))
@@ -1104,7 +1118,8 @@ def _find_ic_uA_guided(
 
     for _ in range(int(refine_bits)):
         if stop_event and stop_event.is_set(): return (sign * (0.5*(low+high)), True, iv)
-        mid = 0.5 * (low + high); v = pulse(mid)
+        mid = 0.5 * (low + high)
+        v = _guided_pulse(sign, mid, pulse_width_s, pulse_settle_s, cooldown_s, collect_iv, iv, stop_event)
         if v is None: return (sign * (0.5*(low+high)), True, iv)
         if abs(v) >= v_thresh: high = mid
         else: low = mid
@@ -1454,6 +1469,284 @@ def _poll_queues(state, status_lbl, bar, ic_line_pos, ic_line_neg, ic_ax, ic_can
         root.after(100, lambda: _poll_queues(state, status_lbl, bar, ic_line_pos, ic_line_neg,
                                              ic_ax, ic_canvas, iv_line, iv_ax, iv_canvas))
 
+@dataclass
+class FFUI:
+    frame: object
+    start_btn: object
+    stop_btn: object
+    status_lbl: object
+    bar: object
+    ic_line_pos: object
+    ic_line_neg: object
+    ic_ax: object
+    ic_canvas: object
+    iv_line: object
+    iv_ax: object
+    iv_canvas: object
+    step_entry: object = None
+    jump_entry: object = None
+
+def _fraunhofer_start_clicked(ui: FFUI):
+    base = simpledialog.askstring("Save name", "Enter a safe base filename (no extension):")
+    if not base:
+        messagebox.showerror("Error", "Please provide a base filename.")
+        return
+    base = _dated_base(base)
+
+    e = ui.frame._entries
+    try:
+        settings = dict(
+            coil_start_mA     = float(e["coil_start_mA"].get()),
+            coil_max_mA       = float(e["coil_max_mA"].get()),
+            log_tier_counts   = _parse_counts(e["log_tier_counts"].get(), DEFAULTS["log_tier_counts"]),
+            nplc              = float(e["nplc"].get()),
+            v_thresh          = float(e["v_thresh"].get()),
+            pulse_width_s     = float(e["pulse_width_ms"].get())  * 1e-3,
+            pulse_settle_s    = float(e["pulse_settle_ms"].get()) * 1e-3,
+            cooldown_s        = float(e["cooldown_ms"].get())     * 1e-3,
+            ic_start_uA       = float(e["ic_start_uA"].get()),
+            ic_growth         = float(e["ic_growth"].get()),
+            ic_max_uA         = float(e["ic_max_uA"].get()),
+            refine_bits       = int(e["refine_bits"].get()),
+            switch_confirm    = int(e["switch_confirm"].get()),
+            ic0_min_uA        = float(e["ic0_min_uA"].get()),
+            coil_settle_s     = float(e["coil_settle_ms"].get())  * 1e-3,
+            coil_ramp_steps   = int(e["coil_ramp_steps"].get()),
+            dT_stop           = float(e["dT_stop"].get()),
+            dT_resume         = float(e["dT_resume"].get()),
+            cooldown_total_s  = float(e["cooldown_total_min"].get())*60.0,
+            adr_trigger_s     = float(e["adr_trigger_min"].get()) *60.0,
+            adr_settle_K      = float(e["adr_settle_K"].get()),
+            post_adr_settle_s = float(e["post_adr_settle_min"].get())*60.0,
+            adr_max_resets    = int(e["adr_max_resets"].get()),
+            band_refine_coil_uA_max = float(e["band_refine_coil_uA_max"].get()),
+            measure_negative  = bool(ui.frame._neg_var.get()),
+            guided_lower_frac = float(DEFAULTS["guided_lower_frac"]),
+            guided_step_rel   = float(DEFAULTS["guided_step_rel"]),
+            guided_min_step_uA= float(DEFAULTS["guided_min_step_uA"]),
+            guided_window_frac= float(DEFAULTS["guided_window_frac"]),
+            iv0_refine        = bool(DEFAULTS["iv0_refine"]),
+            iv0_pts_per_branch= int(DEFAULTS["iv0_pts_per_branch"]),
+            iv0_above_frac    = float(DEFAULTS["iv0_above_frac"]),
+            iv0_window_frac   = float(DEFAULTS["iv0_window_frac"]),
+            band_refine_enable   = bool(DEFAULTS["band_refine_enable"]),
+            band_refine_frac_low = float(DEFAULTS["band_refine_frac_low"]),
+            band_refine_pts      = int(DEFAULTS["band_refine_pts"]),
+            band_refine_top_margin=float(DEFAULTS["band_refine_top_margin"]),
+            error_drain_every_pulses = int(DEFAULTS["error_drain_every_pulses"]),
+            log_anchor_mode   = bool(ui.frame._anchor_var.get()),
+            burst_ops_before_wait = int(DEFAULTS["burst_ops_before_wait"]),
+            burst_backoff_s       = float(DEFAULTS["burst_backoff_s"]),
+        )
+    except Exception as ex:
+        messagebox.showerror("Error", f"Invalid setting: {ex}")
+        return
+
+    _ff_state.stop_event.clear()
+    _ff_state.base = base
+    _ff_state.settings = settings
+    _ff_state.T0 = _get_T()
+    _ff_state.rows_pos.clear(); _ff_state.rows_neg.clear()
+    _ff_state.iv_points.clear(); _ff_state.iv_search_rows.clear()
+    _ff_state.coil_points_A.clear(); _ff_state.icp_points_A.clear(); _ff_state.icn_points_A.clear()
+    _ff_state.adr_events = 0
+
+    global _ERR_DRAIN_EVERY, _pulse_counter
+    _ERR_DRAIN_EVERY = int(settings.get("error_drain_every_pulses", 200))
+    _pulse_counter = 0
+
+    ui.start_btn.config(state=tk.DISABLED)
+    ui.stop_btn.config(state=tk.NORMAL)
+    ui.status_lbl.config(text=f"Starting… T0 = {_ff_state.T0:.3f} K")
+    _ff_state.thread = threading.Thread(target=_worker_run_log, args=(_ff_state,), daemon=True)
+    _ff_state.thread.start()
+    _poll_queues(_ff_state, ui.status_lbl, ui.bar, ui.ic_line_pos, ui.ic_line_neg, ui.ic_ax,
+                 ui.ic_canvas, ui.iv_line, ui.iv_ax, ui.iv_canvas)
+
+def _fraunhofer_stop_clicked(ui: FFUI):
+    if _ff_state and _ff_state.thread and _ff_state.thread.is_alive():
+        _ff_state.stop_event.set()
+        ui.status_lbl.config(text="Stopping… (saving partial data)")
+
+    ui.start_btn.config(state=tk.NORMAL)
+    ui.stop_btn.config(state=tk.DISABLED)
+
+def _linear_apply_step(ui: FFUI):
+    try:
+        val = float(ui.step_entry.get())
+        if _ff_state and _ff_state.thread and _ff_state.thread.is_alive():
+            _ff_state.command_q.put({"op": "set_step", "step_mA": val})
+            ui.status_lbl.config(text=f"Live: new step {val} mA queued")
+    except Exception as ex:
+        messagebox.showerror("Step error", str(ex))
+
+def _linear_do_jump(ui: FFUI):
+    try:
+        val = float(ui.jump_entry.get())
+        if _ff_state and _ff_state.thread and _ff_state.thread.is_alive():
+            _ff_state.command_q.put({"op": "jump", "target_mA": val})
+            ui.status_lbl.config(text=f"Live: jump to {val} mA queued")
+    except Exception as ex:
+        messagebox.showerror("Jump error", str(ex))
+
+def _linear_start_clicked(ui: FFUI):
+    base = simpledialog.askstring("Save name", "Enter a safe base filename (no extension):")
+    if not base:
+        messagebox.showerror("Error", "Please provide a base filename.")
+        return
+    base = _dated_base(base)
+
+    e = ui.frame._entries
+    try:
+        settings = dict(
+            coil_start_mA     = float(e["coil_start_mA"].get()),
+            coil_max_mA       = float(e["coil_max_mA"].get()),
+            coil_step_mA      = float(e["coil_step_mA"].get()),
+            nplc              = float(e["nplc"].get()),
+            v_thresh          = float(e["v_thresh"].get()),
+            pulse_width_s     = float(e["pulse_width_ms"].get())  * 1e-3,
+            pulse_settle_s    = float(e["pulse_settle_ms"].get()) * 1e-3,
+            cooldown_s        = float(e["cooldown_ms"].get())     * 1e-3,
+            ic_start_uA       = float(e["ic_start_uA"].get()),
+            ic_growth         = float(e["ic_growth"].get()),
+            ic_max_uA         = float(e["ic_max_uA"].get()),
+            refine_bits       = int(e["refine_bits"].get()),
+            switch_confirm    = int(e["switch_confirm"].get()),
+            ic0_min_uA        = float(e["ic0_min_uA"].get()),
+            coil_settle_s     = float(e["coil_settle_ms"].get())  * 1e-3,
+            coil_ramp_steps   = int(e["coil_ramp_steps"].get()),
+            dT_stop           = float(e["dT_stop"].get()),
+            dT_resume         = float(e["dT_resume"].get()),
+            cooldown_total_s  = float(e["cooldown_total_min"].get())*60.0,
+            adr_trigger_s     = float(e["adr_trigger_min"].get()) *60.0,
+            adr_settle_K      = float(e["adr_settle_K"].get()),
+            post_adr_settle_s = float(e["post_adr_settle_min"].get())*60.0,
+            adr_max_resets    = int(e["adr_max_resets"].get()),
+            band_refine_coil_uA_max = float(e["band_refine_coil_uA_max"].get()),
+            measure_negative  = bool(ui.frame._neg_var.get()),
+            guided_lower_frac = float(DEFAULTS["guided_lower_frac"]),
+            guided_step_rel   = float(DEFAULTS["guided_step_rel"]),
+            guided_min_step_uA= float(DEFAULTS["guided_min_step_uA"]),
+            guided_window_frac= float(DEFAULTS["guided_window_frac"]),
+            iv0_refine        = bool(DEFAULTS["iv0_refine"]),
+            iv0_pts_per_branch= int(DEFAULTS["iv0_pts_per_branch"]),
+            iv0_above_frac    = float(DEFAULTS["iv0_above_frac"]),
+            iv0_window_frac   = float(DEFAULTS["iv0_window_frac"]),
+            band_refine_enable   = bool(DEFAULTS["band_refine_enable"]),
+            band_refine_frac_low = float(DEFAULTS["band_refine_frac_low"]),
+            band_refine_pts      = int(DEFAULTS["band_refine_pts"]),
+            band_refine_top_margin=float(DEFAULTS["band_refine_top_margin"]),
+            error_drain_every_pulses = int(DEFAULTS["error_drain_every_pulses"]),
+            burst_ops_before_wait = int(DEFAULTS["burst_ops_before_wait"]),
+            burst_backoff_s       = float(DEFAULTS["burst_backoff_s"]),
+        )
+    except Exception as ex:
+        messagebox.showerror("Error", f"Invalid setting: {ex}")
+        return
+
+    _ff_state.stop_event.clear()
+    _ff_state.base = base
+    _ff_state.settings = settings
+    _ff_state.T0 = _get_T()
+    _ff_state.rows_pos.clear(); _ff_state.rows_neg.clear()
+    _ff_state.iv_points.clear(); _ff_state.iv_search_rows.clear()
+    _ff_state.coil_points_A.clear(); _ff_state.icp_points_A.clear(); _ff_state.icn_points_A.clear()
+    _ff_state.adr_events = 0
+
+    global _ERR_DRAIN_EVERY, _pulse_counter
+    _ERR_DRAIN_EVERY = int(settings.get("error_drain_every_pulses", 200))
+    _pulse_counter = 0
+
+    ui.start_btn.config(state=tk.DISABLED)
+    ui.stop_btn.config(state=tk.NORMAL)
+    ui.status_lbl.config(text=f"Starting (linear)… T0 = {_ff_state.T0:.3f} K")
+    _ff_state.thread = threading.Thread(target=_worker_run_linear, args=(_ff_state,), daemon=True)
+    _ff_state.thread.start()
+    _poll_queues(_ff_state, ui.status_lbl, ui.bar, ui.ic_line_pos, ui.ic_line_neg, ui.ic_ax,
+                 ui.ic_canvas, ui.iv_line, ui.iv_ax, ui.iv_canvas)
+
+def _linear_stop_clicked(ui: FFUI):
+    if _ff_state and _ff_state.thread and _ff_state.thread.is_alive():
+        _ff_state.stop_event.set()
+        ui.status_lbl.config(text="Stopping… (saving partial data)")
+
+    ui.start_btn.config(state=tk.NORMAL)
+    ui.stop_btn.config(state=tk.DISABLED)
+
+def _rough_start_clicked(ui: FFUI):
+    base = simpledialog.askstring("Save name", "Enter a base filename (no extension) for ROUGH:")
+    if not base:
+        messagebox.showerror("Error", "Please provide a base filename.")
+        return
+    base = _dated_base(base)
+
+    e = ui.frame._entries
+    try:
+        settings = dict(
+            coil_start_mA     = float(e["coil_start_mA"].get()),
+            rough_max_mA      = float(e["rough_max_mA"].get()),
+            rough_step_mA     = float(e["rough_step_mA"].get()),
+            nplc              = float(e["nplc"].get()),
+            v_thresh          = float(e["v_thresh"].get()),
+            pulse_width_s     = float(e["pulse_width_ms"].get())  * 1e-3,
+            pulse_settle_s    = float(e["pulse_settle_ms"].get()) * 1e-3,
+            cooldown_s        = float(e["cooldown_ms"].get())     * 1e-3,
+            ic_start_uA       = float(DEFAULTS["ic_start_uA"]),
+            ic_growth         = float(DEFAULTS["ic_growth"]),
+            ic_max_uA         = float(DEFAULTS["ic_max_uA"]),
+            rough_refine_bits = int(e["rough_refine_bits"].get()),
+            rough_smooth_pts  = int(e["rough_smooth_pts"].get()),
+            rough_min_prominence = float(e["rough_min_prominence"].get()),
+            coil_settle_s     = float(DEFAULTS["coil_settle_ms"]) * 1e-3,
+            coil_ramp_steps   = int(DEFAULTS["coil_ramp_steps"]),
+            dT_stop           = float(DEFAULTS["dT_stop"]),
+            dT_resume         = float(DEFAULTS["dT_resume"]),
+            cooldown_total_s  = float(DEFAULTS["cooldown_total_min"])*60.0,
+            adr_trigger_s     = float(DEFAULTS["adr_trigger_min"]) *60.0,
+            adr_settle_K      = float(DEFAULTS["adr_settle_K"]),
+            post_adr_settle_s = float(DEFAULTS["post_adr_settle_min"])*60.0,
+            adr_max_resets    = int(DEFAULTS["adr_max_resets"]),
+            measure_negative  = False,
+            error_drain_every_pulses = int(DEFAULTS["error_drain_every_pulses"]),
+            burst_ops_before_wait = int(DEFAULTS["burst_ops_before_wait"]),
+            burst_backoff_s       = float(DEFAULTS["burst_backoff_s"]),
+        )
+    except Exception as ex:
+        messagebox.showerror("Error", f"Invalid setting: {ex}")
+        return
+
+    _ff_state.stop_event.clear()
+    _ff_state.base = base
+    _ff_state.settings = settings
+    _ff_state.T0 = _get_T()
+    _ff_state.rows_pos.clear(); _ff_state.rows_neg.clear()
+    _ff_state.iv_points.clear(); _ff_state.iv_search_rows.clear()
+    _ff_state.coil_points_A.clear(); _ff_state.icp_points_A.clear(); _ff_state.icn_points_A.clear()
+    _ff_state.adr_events = 0
+
+    global _ERR_DRAIN_EVERY, _pulse_counter
+    _ERR_DRAIN_EVERY = int(settings.get("error_drain_every_pulses", 200))
+    _pulse_counter = 0
+
+    ui.start_btn.config(state=tk.DISABLED)
+    ui.stop_btn.config(state=tk.NORMAL)
+    ui.status_lbl.config(text=f"Starting (rough)… T0 = {_ff_state.T0:.3f} K")
+    _ff_state.thread = threading.Thread(target=_worker_run_rough,
+                                        args=(_ff_state, ui.ic_line_pos, ui.ic_ax, ui.ic_canvas,
+                                              ui.status_lbl, ui.bar),
+                                        daemon=True)
+    _ff_state.thread.start()
+    _poll_queues(_ff_state, ui.status_lbl, ui.bar, ui.ic_line_pos, ui.ic_line_neg, ui.ic_ax,
+                 ui.ic_canvas, None, None, None)
+
+def _rough_stop_clicked(ui: FFUI):
+    if _ff_state and _ff_state.thread and _ff_state.thread.is_alive():
+        _ff_state.stop_event.set()
+        ui.status_lbl.config(text="Stopping… (saving partial data)")
+
+    ui.start_btn.config(state=tk.NORMAL)
+    ui.stop_btn.config(state=tk.DISABLED)
+
 def Fraunhofer_Pattern():
     """Logarithmischer Coil-Sweep (center-out ODER Anchor ±Start), threaded UI, Liveplots."""
     closer = (lambda w: on_closing(w)) if 'on_closing' in globals() else (lambda w: w.destroy())
@@ -1483,92 +1776,23 @@ def Fraunhofer_Pattern():
     global _ff_state, _pulse_counter, _ERR_DRAIN_EVERY
     _ff_state = FFState()
     _pulse_counter = 0
+    ui = FFUI(
+        frame=frame,
+        start_btn=start_btn,
+        stop_btn=stop_btn,
+        status_lbl=status_lbl,
+        bar=bar,
+        ic_line_pos=ic_line_pos,
+        ic_line_neg=ic_line_neg,
+        ic_ax=ic_ax,
+        ic_canvas=ic_canvas,
+        iv_line=iv_line,
+        iv_ax=iv_ax,
+        iv_canvas=iv_canvas,
+    )
 
-    def start_clicked():
-        base = simpledialog.askstring("Save name", "Enter a safe base filename (no extension):")
-        if not base:
-            messagebox.showerror("Error", "Please provide a base filename."); return
-        base = _dated_base(base)
-
-        e = frame._entries
-        try:
-            settings = dict(
-                coil_start_mA     = float(e["coil_start_mA"].get()),
-                coil_max_mA       = float(e["coil_max_mA"].get()),
-                log_tier_counts   = _parse_counts(e["log_tier_counts"].get(), DEFAULTS["log_tier_counts"]),
-                nplc              = float(e["nplc"].get()),
-                v_thresh          = float(e["v_thresh"].get()),
-                pulse_width_s     = float(e["pulse_width_ms"].get())  * 1e-3,
-                pulse_settle_s    = float(e["pulse_settle_ms"].get()) * 1e-3,
-                cooldown_s        = float(e["cooldown_ms"].get())     * 1e-3,
-                ic_start_uA       = float(e["ic_start_uA"].get()),
-                ic_growth         = float(e["ic_growth"].get()),
-                ic_max_uA         = float(e["ic_max_uA"].get()),
-                refine_bits       = int(e["refine_bits"].get()),
-                switch_confirm    = int(e["switch_confirm"].get()),
-                ic0_min_uA        = float(e["ic0_min_uA"].get()),
-                coil_settle_s     = float(e["coil_settle_ms"].get())  * 1e-3,
-                coil_ramp_steps   = int(e["coil_ramp_steps"].get()),
-                dT_stop           = float(e["dT_stop"].get()),
-                dT_resume         = float(e["dT_resume"].get()),
-                cooldown_total_s  = float(e["cooldown_total_min"].get())*60.0,
-                adr_trigger_s     = float(e["adr_trigger_min"].get()) *60.0,
-                adr_settle_K      = float(e["adr_settle_K"].get()),
-                post_adr_settle_s = float(e["post_adr_settle_min"].get())*60.0,
-                adr_max_resets    = int(e["adr_max_resets"].get()),
-                band_refine_coil_uA_max = float(e["band_refine_coil_uA_max"].get()),
-                measure_negative  = bool(frame._neg_var.get()),
-                guided_lower_frac = float(DEFAULTS["guided_lower_frac"]),
-                guided_step_rel   = float(DEFAULTS["guided_step_rel"]),
-                guided_min_step_uA= float(DEFAULTS["guided_min_step_uA"]),
-                guided_window_frac= float(DEFAULTS["guided_window_frac"]),
-                iv0_refine        = bool(DEFAULTS["iv0_refine"]),
-                iv0_pts_per_branch= int(DEFAULTS["iv0_pts_per_branch"]),
-                iv0_above_frac    = float(DEFAULTS["iv0_above_frac"]),
-                iv0_window_frac   = float(DEFAULTS["iv0_window_frac"]),
-                band_refine_enable   = bool(DEFAULTS["band_refine_enable"]),
-                band_refine_frac_low = float(DEFAULTS["band_refine_frac_low"]),
-                band_refine_pts      = int(DEFAULTS["band_refine_pts"]),
-                band_refine_top_margin=float(DEFAULTS["band_refine_top_margin"]),
-                error_drain_every_pulses = int(DEFAULTS["error_drain_every_pulses"]),
-                log_anchor_mode   = bool(frame._anchor_var.get()),
-                burst_ops_before_wait = int(DEFAULTS["burst_ops_before_wait"]),
-                burst_backoff_s       = float(DEFAULTS["burst_backoff_s"]),
-            )
-        except Exception as ex:
-            messagebox.showerror("Error", f"Invalid setting: {ex}"); return
-
-        _ff_state.stop_event.clear()
-        _ff_state.base = base
-        _ff_state.settings = settings
-        _ff_state.T0 = _get_T()
-        _ff_state.rows_pos.clear(); _ff_state.rows_neg.clear()
-        _ff_state.iv_points.clear(); _ff_state.iv_search_rows.clear()
-        _ff_state.coil_points_A.clear(); _ff_state.icp_points_A.clear(); _ff_state.icn_points_A.clear()
-        _ff_state.adr_events = 0
-
-        global _ERR_DRAIN_EVERY, _pulse_counter
-        _ERR_DRAIN_EVERY = int(settings.get("error_drain_every_pulses", 200))
-        _pulse_counter = 0
-
-        start_btn.config(state=tk.DISABLED); stop_btn.config(state=tk.NORMAL)
-        status_lbl.config(text=f"Starting… T0 = {_ff_state.T0:.3f} K")
-        _ff_state.thread = threading.Thread(target=_worker_run_log, args=(_ff_state,), daemon=True)
-        _ff_state.thread.start()
-        _poll_queues(_ff_state, status_lbl, bar, ic_line_pos, ic_line_neg, ic_ax, ic_canvas,
-                     iv_line, iv_ax, iv_canvas)
-
-    def stop_clicked():
-        if _ff_state and _ff_state.thread and _ff_state.thread.is_alive():
-            _ff_state.stop_event.set()
-            status_lbl.config(text="Stopping… (saving partial data)")
-
-        # Buttons zurücksetzen (erneut startbar)
-        start_btn.config(state=tk.NORMAL)
-        stop_btn.config(state=tk.DISABLED)
-
-    start_btn.config(command=start_clicked)
-    stop_btn.config(command=stop_clicked)
+    start_btn.config(command=partial(_fraunhofer_start_clicked, ui))
+    stop_btn.config(command=partial(_fraunhofer_stop_clicked, ui))
     return win
 
 
@@ -1592,32 +1816,14 @@ def MagneticMeasurementLinear():
     tk.Label(live, text="New step (mA)").grid(row=0, column=0, padx=4, pady=2, sticky="e")
     step_entry = tk.Entry(live, width=10); step_entry.insert(0, str(DEFAULTS["coil_step_mA"]))
     step_entry.grid(row=0, column=1, padx=4, pady=2)
-
-    def apply_step():
-        try:
-            val = float(step_entry.get())
-            if _ff_state and _ff_state.thread and _ff_state.thread.is_alive():
-                _ff_state.command_q.put({"op": "set_step", "step_mA": val})
-                status_lbl.config(text=f"Live: new step {val} mA queued")
-        except Exception as ex:
-            messagebox.showerror("Step error", str(ex))
-
-    tk.Button(live, text="Apply step", width=12, command=apply_step).grid(row=0, column=2, padx=6, pady=2)
+    apply_btn = tk.Button(live, text="Apply step", width=12)
+    apply_btn.grid(row=0, column=2, padx=6, pady=2)
 
     tk.Label(live, text="Jump to (mA)").grid(row=1, column=0, padx=4, pady=2, sticky="e")
     jump_entry = tk.Entry(live, width=10); jump_entry.insert(0, "0.0")
     jump_entry.grid(row=1, column=1, padx=4, pady=2)
-
-    def do_jump():
-        try:
-            val = float(jump_entry.get())
-            if _ff_state and _ff_state.thread and _ff_state.thread.is_alive():
-                _ff_state.command_q.put({"op": "jump", "target_mA": val})
-                status_lbl.config(text=f"Live: jump to {val} mA queued")
-        except Exception as ex:
-            messagebox.showerror("Jump error", str(ex))
-
-    tk.Button(live, text="Jump", width=12, command=do_jump).grid(row=1, column=2, padx=6, pady=2)
+    jump_btn = tk.Button(live, text="Jump", width=12)
+    jump_btn.grid(row=1, column=2, padx=6, pady=2)
 
     ic_win, ic_fig, ic_ax, ic_line_pos, ic_line_neg, ic_canvas = _make_plot_window(
         title="Ic vs I_coil (linear, live)", xlab="I_coil (A)", ylab="Ic (A)", with_two_series=True
@@ -1629,90 +1835,27 @@ def MagneticMeasurementLinear():
     global _ff_state, _pulse_counter, _ERR_DRAIN_EVERY
     _ff_state = FFState()
     _pulse_counter = 0
+    ui = FFUI(
+        frame=frame,
+        start_btn=start_btn,
+        stop_btn=stop_btn,
+        status_lbl=status_lbl,
+        bar=bar,
+        ic_line_pos=ic_line_pos,
+        ic_line_neg=ic_line_neg,
+        ic_ax=ic_ax,
+        ic_canvas=ic_canvas,
+        iv_line=iv_line,
+        iv_ax=iv_ax,
+        iv_canvas=iv_canvas,
+        step_entry=step_entry,
+        jump_entry=jump_entry,
+    )
 
-    def start_clicked():
-        base = simpledialog.askstring("Save name", "Enter a safe base filename (no extension):")
-        if not base:
-            messagebox.showerror("Error", "Please provide a base filename."); return
-        base = _dated_base(base)
-
-        e = frame._entries
-        try:
-            settings = dict(
-                coil_start_mA     = float(e["coil_start_mA"].get()),
-                coil_max_mA       = float(e["coil_max_mA"].get()),
-                coil_step_mA      = float(e["coil_step_mA"].get()),
-                nplc              = float(e["nplc"].get()),
-                v_thresh          = float(e["v_thresh"].get()),
-                pulse_width_s     = float(e["pulse_width_ms"].get())  * 1e-3,
-                pulse_settle_s    = float(e["pulse_settle_ms"].get()) * 1e-3,
-                cooldown_s        = float(e["cooldown_ms"].get())     * 1e-3,
-                ic_start_uA       = float(e["ic_start_uA"].get()),
-                ic_growth         = float(e["ic_growth"].get()),
-                ic_max_uA         = float(e["ic_max_uA"].get()),
-                refine_bits       = int(e["refine_bits"].get()),
-                switch_confirm    = int(e["switch_confirm"].get()),
-                ic0_min_uA        = float(e["ic0_min_uA"].get()),
-                coil_settle_s     = float(e["coil_settle_ms"].get())  * 1e-3,
-                coil_ramp_steps   = int(e["coil_ramp_steps"].get()),
-                dT_stop           = float(e["dT_stop"].get()),
-                dT_resume         = float(e["dT_resume"].get()),
-                cooldown_total_s  = float(e["cooldown_total_min"].get())*60.0,
-                adr_trigger_s     = float(e["adr_trigger_min"].get()) *60.0,
-                adr_settle_K      = float(e["adr_settle_K"].get()),
-                post_adr_settle_s = float(e["post_adr_settle_min"].get())*60.0,
-                adr_max_resets    = int(e["adr_max_resets"].get()),
-                band_refine_coil_uA_max = float(e["band_refine_coil_uA_max"].get()),
-                measure_negative  = bool(frame._neg_var.get()),
-                guided_lower_frac = float(DEFAULTS["guided_lower_frac"]),
-                guided_step_rel   = float(DEFAULTS["guided_step_rel"]),
-                guided_min_step_uA= float(DEFAULTS["guided_min_step_uA"]),
-                guided_window_frac= float(DEFAULTS["guided_window_frac"]),
-                iv0_refine        = bool(DEFAULTS["iv0_refine"]),
-                iv0_pts_per_branch= int(DEFAULTS["iv0_pts_per_branch"]),
-                iv0_above_frac    = float(DEFAULTS["iv0_above_frac"]),
-                iv0_window_frac   = float(DEFAULTS["iv0_window_frac"]),
-                band_refine_enable   = bool(DEFAULTS["band_refine_enable"]),
-                band_refine_frac_low = float(DEFAULTS["band_refine_frac_low"]),
-                band_refine_pts      = int(DEFAULTS["band_refine_pts"]),
-                band_refine_top_margin=float(DEFAULTS["band_refine_top_margin"]),
-                error_drain_every_pulses = int(DEFAULTS["error_drain_every_pulses"]),
-                burst_ops_before_wait = int(DEFAULTS["burst_ops_before_wait"]),
-                burst_backoff_s       = float(DEFAULTS["burst_backoff_s"]),
-            )
-        except Exception as ex:
-            messagebox.showerror("Error", f"Invalid setting: {ex}"); return
-
-        _ff_state.stop_event.clear()
-        _ff_state.base = base
-        _ff_state.settings = settings
-        _ff_state.T0 = _get_T()
-        _ff_state.rows_pos.clear(); _ff_state.rows_neg.clear()
-        _ff_state.iv_points.clear(); _ff_state.iv_search_rows.clear()
-        _ff_state.coil_points_A.clear(); _ff_state.icp_points_A.clear(); _ff_state.icn_points_A.clear()
-        _ff_state.adr_events = 0
-
-        global _ERR_DRAIN_EVERY, _pulse_counter
-        _ERR_DRAIN_EVERY = int(settings.get("error_drain_every_pulses", 200))
-        _pulse_counter = 0
-
-        start_btn.config(state=tk.DISABLED); stop_btn.config(state=tk.NORMAL)
-        status_lbl.config(text=f"Starting (linear)… T0 = {_ff_state.T0:.3f} K")
-        _ff_state.thread = threading.Thread(target=_worker_run_linear, args=(_ff_state,), daemon=True)
-        _ff_state.thread.start()
-        _poll_queues(_ff_state, status_lbl, bar, ic_line_pos, ic_line_neg, ic_ax, ic_canvas,
-                     iv_line, iv_ax, iv_canvas)
-
-    def stop_clicked():
-        if _ff_state and _ff_state.thread and _ff_state.thread.is_alive():
-            _ff_state.stop_event.set()
-            status_lbl.config(text="Stopping… (saving partial data)")
-
-        start_btn.config(state=tk.NORMAL)
-        stop_btn.config(state=tk.DISABLED)
-
-    start_btn.config(command=start_clicked)
-    stop_btn.config(command=stop_clicked)
+    apply_btn.config(command=partial(_linear_apply_step, ui))
+    jump_btn.config(command=partial(_linear_do_jump, ui))
+    start_btn.config(command=partial(_linear_start_clicked, ui))
+    stop_btn.config(command=partial(_linear_stop_clicked, ui))
     return win
 
 
@@ -1736,79 +1879,23 @@ def RoughScan():
     global _ff_state, _pulse_counter, _ERR_DRAIN_EVERY
     _ff_state = FFState()
     _pulse_counter = 0
+    ui = FFUI(
+        frame=frame,
+        start_btn=start_btn,
+        stop_btn=stop_btn,
+        status_lbl=status_lbl,
+        bar=bar,
+        ic_line_pos=ic_line_pos,
+        ic_line_neg=ic_line_neg,
+        ic_ax=ic_ax,
+        ic_canvas=ic_canvas,
+        iv_line=None,
+        iv_ax=None,
+        iv_canvas=None,
+    )
 
-    def start_clicked():
-        base = simpledialog.askstring("Save name", "Enter a base filename (no extension) for ROUGH:")
-        if not base:
-            messagebox.showerror("Error", "Please provide a base filename."); return
-        base = _dated_base(base)
-
-        e = frame._entries
-        try:
-            settings = dict(
-                coil_start_mA     = float(e["coil_start_mA"].get()),
-                rough_max_mA      = float(e["rough_max_mA"].get()),
-                rough_step_mA     = float(e["rough_step_mA"].get()),
-                nplc              = float(e["nplc"].get()),
-                v_thresh          = float(e["v_thresh"].get()),
-                pulse_width_s     = float(e["pulse_width_ms"].get())  * 1e-3,
-                pulse_settle_s    = float(e["pulse_settle_ms"].get()) * 1e-3,
-                cooldown_s        = float(e["cooldown_ms"].get())     * 1e-3,
-                ic_start_uA       = float(DEFAULTS["ic_start_uA"]),   # schnell
-                ic_growth         = float(DEFAULTS["ic_growth"]),
-                ic_max_uA         = float(DEFAULTS["ic_max_uA"]),
-                rough_refine_bits = int(e["rough_refine_bits"].get()),
-                rough_smooth_pts  = int(e["rough_smooth_pts"].get()),
-                rough_min_prominence = float(e["rough_min_prominence"].get()),
-                coil_settle_s     = float(DEFAULTS["coil_settle_ms"]) * 1e-3,
-                coil_ramp_steps   = int(DEFAULTS["coil_ramp_steps"]),
-                dT_stop           = float(DEFAULTS["dT_stop"]),
-                dT_resume         = float(DEFAULTS["dT_resume"]),
-                cooldown_total_s  = float(DEFAULTS["cooldown_total_min"])*60.0,
-                adr_trigger_s     = float(DEFAULTS["adr_trigger_min"]) *60.0,
-                adr_settle_K      = float(DEFAULTS["adr_settle_K"]),
-                post_adr_settle_s = float(DEFAULTS["post_adr_settle_min"])*60.0,
-                adr_max_resets    = int(DEFAULTS["adr_max_resets"]),
-                measure_negative  = False,  # rough: nur |Ic| (schnell)
-                error_drain_every_pulses = int(DEFAULTS["error_drain_every_pulses"]),
-                burst_ops_before_wait = int(DEFAULTS["burst_ops_before_wait"]),
-                burst_backoff_s       = float(DEFAULTS["burst_backoff_s"]),
-            )
-        except Exception as ex:
-            messagebox.showerror("Error", f"Invalid setting: {ex}"); return
-
-        _ff_state.stop_event.clear()
-        _ff_state.base = base
-        _ff_state.settings = settings
-        _ff_state.T0 = _get_T()
-        _ff_state.rows_pos.clear(); _ff_state.rows_neg.clear()
-        _ff_state.iv_points.clear(); _ff_state.iv_search_rows.clear()
-        _ff_state.coil_points_A.clear(); _ff_state.icp_points_A.clear(); _ff_state.icn_points_A.clear()
-        _ff_state.adr_events = 0
-
-        global _ERR_DRAIN_EVERY, _pulse_counter
-        _ERR_DRAIN_EVERY = int(settings.get("error_drain_every_pulses", 200))
-        _pulse_counter = 0
-
-        start_btn.config(state=tk.DISABLED); stop_btn.config(state=tk.NORMAL)
-        status_lbl.config(text=f"Starting (rough)… T0 = {_ff_state.T0:.3f} K")
-        _ff_state.thread = threading.Thread(target=_worker_run_rough,
-                                            args=(_ff_state, ic_line_pos, ic_ax, ic_canvas, status_lbl, bar),
-                                            daemon=True)
-        _ff_state.thread.start()
-        _poll_queues(_ff_state, status_lbl, bar, ic_line_pos, ic_line_neg, ic_ax, ic_canvas,
-                     None, None, None)
-
-    def stop_clicked():
-        if _ff_state and _ff_state.thread and _ff_state.thread.is_alive():
-            _ff_state.stop_event.set()
-            status_lbl.config(text="Stopping… (saving partial data)")
-
-        start_btn.config(state=tk.NORMAL)
-        stop_btn.config(state=tk.DISABLED)
-
-    start_btn.config(command=start_clicked)
-    stop_btn.config(command=stop_clicked)
+    start_btn.config(command=partial(_rough_start_clicked, ui))
+    stop_btn.config(command=partial(_rough_stop_clicked, ui))
     return win
 
 
@@ -2106,23 +2193,18 @@ def _build_signed_pair_plan_from(current_uA, max_mA, step_mA, *, include_negativ
     seq = []
     seen = set()
 
-    def add(v):
-        key = round(float(v), 9)
-        if abs(v) <= max_uA + 1e-9 and key not in seen:
-            seq.append(float(v)); seen.add(key)
-
-    add(sign0 * m0)
+    _append_unique_value(seq, seen, sign0 * m0, max_uA)
     if include_negative:
-        add(-sign0 * m0)
+        _append_unique_value(seq, seen, -sign0 * m0, max_uA)
 
     kstep = 1
     while True:
         mag = m0 + kstep * step_uA
         if mag > max_uA + 1e-9:
             break
-        add(sign0 * mag)
+        _append_unique_value(seq, seen, sign0 * mag, max_uA)
         if include_negative:
-            add(-sign0 * mag)
+            _append_unique_value(seq, seen, -sign0 * mag, max_uA)
         kstep += 1
 
     return seq
@@ -2411,16 +2493,8 @@ def _find_extrema_centered(x, y, min_prom_rel=0.05):
     if len(y) > 0:
         yr = max(1e-12, (np.nanmax(y) - np.nanmin(y)))
         thr = float(min_prom_rel) * yr
-        def prominent(idxs, invert=False):
-            keep = []
-            for idx in idxs:
-                val = y[idx]
-                left = y[max(0, idx-1)]; right = y[min(len(y)-1, idx+1)]
-                prom = (val - min(left, right)) if not invert else (max(left, right) - val)
-                if prom >= thr: keep.append(idx)
-            return keep
-        maxs = prominent(maxs, invert=False)
-        mins = prominent(mins, invert=True)
+        maxs = _extrema_prominent(maxs, y, thr, invert=False)
+        mins = _extrema_prominent(mins, y, thr, invert=True)
     return mins, maxs
 
 
@@ -2603,137 +2677,136 @@ def create_tc_frame(parent):
     tk.Button(frame, text="Remove", command=frame.destroy).grid(row=1, column=4)
     return frame
 
+@dataclass
+class TcMeasurementUI:
+    sections_frame: object
+    section_frames: list
+    measurement_started: object
+    tc_window: object
+
+def _tc_add_section(ui: TcMeasurementUI):
+    frame = create_tc_frame(ui.sections_frame)
+    frame.pack(fill=tk.X)
+    ui.section_frames.append(frame)
+
+def _tc_update_r_plot(temp_data, resistance_data, line, ax, fig, _frame):
+    if temp_data:
+        line.set_data(temp_data, resistance_data)
+        ax.relim()
+        ax.autoscale_view()
+        fig.canvas.flush_events()
+
+def _tc_get_data(ui: TcMeasurementUI):
+    tc_data = []
+    maximumProgress = 0
+    offset = 0
+    for frame in ui.section_frames:
+        try:
+            start_temp = float(frame.winfo_children()[1].get())
+            if 0.199 < start_temp < 290:
+                None
+            else:
+                Errormessage("Out of Value Range 0.2-290K")
+                if start_temp > 290:
+                    start_temp = 290
+                else:
+                    start_temp = 0.2
+            end_temp = float(frame.winfo_children()[3].get())
+            if 0.2 < end_temp < 290:
+                None
+            else:
+                Errormessage("Out of Value Range 0.2-290K")
+                if end_temp > 290:
+                    end_temp = 290
+                else:
+                    end_temp = 0.2
+            ramp_speed = float(frame.winfo_children()[5].get())
+            ramp_current = float(frame.winfo_children()[7].get()) / 1000000
+            tc_data.append((start_temp, end_temp, ramp_speed, ramp_current))
+            maximumProgress = maximumProgress + abs(end_temp - start_temp)
+        except ValueError:
+            print("Fehler")
+            tk.messagebox.showerror("Fehler", "Ungültige Eingabe")
+            return
+        except tk.TclError as e:
+            if "bad window path name" not in str(e):
+                raise e
+
+    print(tc_data)
+    progress_window = tk.Toplevel(root)
+    progress_window.title("Tc Measurement Progress")
+    progress_bar = ttk.Progressbar(progress_window, maximum=maximumProgress, length=300)
+    progress_bar.pack(padx=20, pady=20)
+    progress_window.update()
+    global rt
+    rt = ResultTable(
+        column_titles=['Time',  'Current [A]','Voltage[V]','Temperature[K]'],
+        units=[' ',  'V',"A",'K'],
+        params={'recorded': time.asctime(), 'sweep_type': 'tc'},
+    )
+    user_input = simpledialog.askstring("Insert Filename", "Please insert the file Name:")
+    NameWindow = str(user_input)
+    plot_window, fig, ax, line = create_plot_window_for_Resistance(NameWindow)
+
+    Temp_data = []
+    Resistance_data = []
+
+    ani = FuncAnimation(fig, partial(_tc_update_r_plot, Temp_data, Resistance_data, line, ax, fig),
+                        frames=10000, repeat=False, interval=5000)
+    ani._start()
+    for start_temp, end_temp, ramp_speed, ramp_current in tc_data:
+        if start_temp + 5 < temperature_control.kelvin and start_temp > 5:
+            pass
+        else:
+            temperature_control.start((start_temp, ramp_speed))
+        if ui.measurement_started.get() == 1:
+            temperature_control.start((end_temp, ramp_speed))
+            k.smua.source.output = 1
+            k.smua.source.func = 2
+            k.apply_current(k.smua, ramp_current)
+            while abs(client.query('T_sample.kelvin') - start_temp) > 0.1:
+                voltage = k.smua.measure.v()
+                timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                temperature = temperature_control.kelvin
+                Temp_data.append(temperature)
+                rt.append_row([timestamp, ramp_current, voltage, temperature])
+                Resistance_data.append(voltage / ramp_current)
+                time.sleep(0.2)
+        else:
+            while abs(client.query('T_sample.kelvin') - start_temp) > 0.1:
+                time.sleep(0.2)
+            temperature_control.start((end_temp, ramp_speed))
+            k.smua.source.output = 1
+            k.smua.source.func = 2
+            k.apply_current(k.smua, ramp_current)
+        while abs(client.query('T_sample.kelvin') - end_temp) > 0.01:
+            voltage = k.smua.measure.v()
+            timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            temperature = temperature_control.kelvin
+            Temp_data.append(temperature)
+            rt.append_row([timestamp, ramp_current, voltage, temperature])
+            Resistance_data.append(voltage / ramp_current)
+            progress_bar['value'] = abs(temperature - start_temp) + offset
+            progress_window.update()
+            time.sleep(0.2)
+        offset = offset + abs(end_temp - start_temp)
+    data_numeric = np.array([[timestamp] + list(map(float, values)) for timestamp, *values in rt.data])
+    safe_file(data_numeric, user_input)
+    ui.tc_window.destroy()
+    progress_window.destroy()
+    k.smua.source.output = 0
+    k2.smua.source.output = 0
+    global measurement
+    measurement = 0
+    try:
+        ani._stop()
+    except AttributeError:
+        pass
 # New function to create the Tc measurement window
 def create_tc_measurement():
     global measurement 
     measurement = 1
     k.smua.sense = k.smua.SENSE_LOCAL
-    def add_tc_section():
-        frame = create_tc_frame(sections_frame)
-        frame.pack(fill=tk.X)
-        section_frames.append(frame)
-    
-    def get_tc_data():
-        tc_data = []
-        maximumProgress = 0
-        offset=0
-        for frame in section_frames:
-            try:
-                start_temp = float(frame.winfo_children()[1].get())
-                if 0.199<start_temp <290:
-                    None
-                else:
-                    Errormessage("Out of Value Range 0.2-290K")
-                    if start_temp >290:
-                        start_temp = 290
-                    else:
-                        start_temp = 0.2
-                end_temp = float(frame.winfo_children()[3].get())
-                if 0.2<end_temp <290:
-                    None
-                else:
-                    Errormessage("Out of Value Range 0.2-290K")
-                    if end_temp >290:
-                        end_temp = 290
-                    else:
-                        end_temp = 0.2
-                ramp_speed = float(frame.winfo_children()[5].get())
-                ramp_current = float(frame.winfo_children()[7].get())/1000000
-                tc_data.append((start_temp, end_temp, ramp_speed, ramp_current))
-                maximumProgress = maximumProgress + abs(end_temp - start_temp)
-            except ValueError:
-                print("Fehler")
-                tk.messagebox.showerror("Fehler", "Ungültige Eingabe")  # Fehlermeldung anzeigen
-                return
-            except tk.TclError as e:
-                 #Handle the case where the frame was removed, and its widgets no longer exist
-                 if "bad window path name" not in str(e):
-                     raise e
-            
-        print(tc_data)  # For debugging, print the collected data
-        progress_window = tk.Toplevel(root)  # New window for the progress bar
-        progress_window.title("Tc Measurement Progress")
-        progress_bar = ttk.Progressbar(progress_window, maximum=maximumProgress, length=300)
-        progress_bar.pack(padx=20, pady=20)
-        progress_window.update()  # Update the window to show the progress bar
-        global rt
-        rt = ResultTable(
-            column_titles=['Time',  'Current [A]','Voltage[V]','Temperature[K]'],
-            units=[' ',  'V',"A",'K'],
-            params={'recorded': time.asctime(), 'sweep_type': 'tc'},
-        )
-        user_input = simpledialog.askstring("Insert Filename", "Please insert the file Name:")
-        NameWindow = str(user_input)
-        plot_window, fig, ax, line = create_plot_window_for_Resistance(NameWindow)
-        
-        Temp_data=[]
-        Resistance_data=[]
-        
-        def update_R_plot(_):
-            nonlocal Temp_data
-            nonlocal Resistance_data
-            if Temp_data:
-                Temp_values, Resistance_values = Temp_data,Resistance_data
-                line.set_data(Temp_values, Resistance_values)
-                ax.relim()
-                ax.autoscale_view()
-                fig.canvas.flush_events()
-        ani = FuncAnimation(fig, update_R_plot, frames=10000, repeat=False, interval=5000)
-        ani._start()
-        for start_temp, end_temp, ramp_speed, ramp_current in tc_data:
-            # Set initial temperature
-            if start_temp+5<temperature_control.kelvin and start_temp >5:
-                pass
-            else:    
-                temperature_control.start((start_temp, ramp_speed))
-            # Wait until the target start temperature is reached within 0.01K certainty
-            if measurement_started.get() == 1:
-                temperature_control.start((end_temp, ramp_speed))# Apply current continuously and measure voltage until target end temperature is reached within 0.01K certainty
-                k.smua.source.output = 1
-                k.smua.source.func = 2
-                k.apply_current(k.smua, ramp_current)
-                while abs(client.query('T_sample.kelvin') - start_temp) > 0.1:
-                    voltage = k.smua.measure.v()  # Measure the voltage
-                    timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')  # Get the current time
-                    temperature = temperature_control.kelvin # Get the current temperature
-                    Temp_data.append(temperature)
-                    rt.append_row([timestamp, ramp_current,voltage, temperature])  # Append data to the ResultTable
-                    Resistance_data.append(voltage/ramp_current)
-                    time.sleep(0.2)  # Wait for 0.1 seconds
-            else:
-                while abs(client.query('T_sample.kelvin') - start_temp) > 0.1:
-                    time.sleep(0.2)  # Wait for 0.1 seconds
-                temperature_control.start((end_temp, ramp_speed))# Apply current continuously and measure voltage until target end temperature is reached within 0.01K certainty
-                k.smua.source.output = 1
-                k.smua.source.func = 2
-                k.apply_current(k.smua, ramp_current)
-            # Set the next temperature
-              # Apply the current
-            
-            while abs(client.query('T_sample.kelvin') - end_temp) > 0.01:                
-                voltage = k.smua.measure.v()  # Measure the voltage
-                timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')  # Get the current time
-                temperature = temperature_control.kelvin # Get the current temperature
-                Temp_data.append(temperature)
-                rt.append_row([timestamp, ramp_current,voltage, temperature])  # Append data to the ResultTable
-                Resistance_data.append(voltage/ramp_current)
-                progress_bar['value'] = abs(temperature - start_temp)+offset  # Update the progress bar
-                progress_window.update()  # Update the window to show the progress
-                time.sleep(0.2)  # Wait for 0.2 seconds
-            offset=offset+abs(end_temp - start_temp)
-        # Format the data for saving
-        data_numeric = np.array([[timestamp] + list(map(float, values)) for timestamp, *values in rt.data])
-        safe_file(data_numeric,user_input)
-        tc_window.destroy()
-        progress_window.destroy()  # Close the progress window
-        k.smua.source.output = 0
-        k2.smua.source.output = 0
-        global measurement 
-        measurement = 0
-        try:
-            ani._stop()
-        except AttributeError:
-            pass  # Ignore the AttributeError if animation has already run through
     section_frames = []
     tc_window = tk.Toplevel(root)
     tc_window.title("Tc Measurement")
@@ -2742,15 +2815,22 @@ def create_tc_measurement():
     sections_frame = tk.Frame(tc_window)
     sections_frame.grid(row=0, column=0, padx=10, pady=10)
 
-    add_tc_section()  # Add one section to begin with
+    ui = TcMeasurementUI(
+        sections_frame=sections_frame,
+        section_frames=section_frames,
+        measurement_started=measurement_started,
+        tc_window=tc_window,
+    )
+
+    _tc_add_section(ui)  # Add one section to begin with
 
     controls_frame = tk.Frame(tc_window)
     controls_frame.grid(row=1, column=0, padx=10, pady=10)
 
     # Place the Checkbutton and buttons in the controls_frame using grid
     tk.Checkbutton(controls_frame, text="Start Measurement", variable=measurement_started).grid(row=0, column=0, columnspan=2)
-    tk.Button(controls_frame, text="Add Section", command=add_tc_section).grid(row=0, column=2)
-    tk.Button(controls_frame, text="Measurement start", command=get_tc_data).grid(row=0, column=3)
+    tk.Button(controls_frame, text="Add Section", command=partial(_tc_add_section, ui)).grid(row=0, column=2)
+    tk.Button(controls_frame, text="Measurement start", command=partial(_tc_get_data, ui)).grid(row=0, column=3)
     
     # Additional widgets or layout adjustments can be made here if needed
     
@@ -2766,6 +2846,13 @@ def create_tc_measurement():
 
 #%% Cell 5: Simple IV Curve (with ETA)
 #%% Cell 5: Simple IV Curve (with ETA and correct V↔I mapping)
+
+def _update_iv_plot(voltage_data, current_data, line, ax, fig, _frame):
+    if voltage_data:
+        line.set_data(voltage_data, current_data)
+        ax.relim()
+        ax.autoscale_view()
+        fig.canvas.flush_events()
 
 def run_sweep(sweep_points, user_input, user_input2=None):
     global measurement
@@ -2825,22 +2912,12 @@ def run_sweep(sweep_points, user_input, user_input2=None):
         voltage_data2, current_data2 = [], []
 
     # 8) Live-plot updaters (voltage on x, current on y)
-    def update_iv_plot(_):
-        if voltage_data:
-            line.set_data(voltage_data, current_data)
-            ax.relim(); ax.autoscale_view()
-            fig.canvas.flush_events()
-
-    def update_iv_plot2(_):
-        if voltage_data2:
-            line2.set_data(voltage_data2, current_data2)
-            ax2.relim(); ax2.autoscale_view()
-            fig2.canvas.flush_events()
-
-    ani  = FuncAnimation(fig,   update_iv_plot,  frames=10000, repeat=False, interval=5000)
+    ani = FuncAnimation(fig, partial(_update_iv_plot, voltage_data, current_data, line, ax, fig),
+                        frames=10000, repeat=False, interval=5000)
     ani._start()
     if use_smu2:
-        ani2 = FuncAnimation(fig2, update_iv_plot2, frames=10000, repeat=False, interval=5000)
+        ani2 = FuncAnimation(fig2, partial(_update_iv_plot, voltage_data2, current_data2, line2, ax2, fig2),
+                             frames=10000, repeat=False, interval=5000)
         ani2._start()
 
     # 9) Main sweep
@@ -2968,6 +3045,54 @@ def create_section_frame(parent):
 
     return frame
 
+@dataclass
+class SweepUI:
+    section_frames: list
+    sections_frame: object
+    save_var: object
+    sweep_window: object
+
+def _sweep_add_section(ui: SweepUI):
+    frame = create_section_frame(ui.sections_frame)
+    frame.pack(fill=tk.X)
+    ui.section_frames.append(frame)
+
+def _sweep_run(ui: SweepUI):
+    sweep_points = []
+    total_steps = 0
+    for frame in ui.section_frames:
+        try:
+            start_value = frame.winfo_children()[1].get()
+            end_value = frame.winfo_children()[3].get()
+            steps_value = frame.winfo_children()[5].get()
+            print(f"Start: {start_value}, End: {end_value}, Steps: {steps_value}")
+            start = float(start_value)
+            end = float(end_value)
+            steps = int(steps_value)
+            sweep_points.append((start, end, steps))
+            total_steps += steps
+        except ValueError:
+            print("Fehler")
+            tk.messagebox.showerror("Fehler", "Ungültige Eingabe")
+            return
+        except tk.TclError as e:
+            if "bad window path name" not in str(e):
+                raise e
+    if ui.save_var.get():
+        save_sweep(sweep_points)
+    user_input = simpledialog.askstring("Insert Filename", "Please insert the file Name:")
+    use_smu2var = use_smu2_var.get()
+    if use_smu2var:
+        user_input2 = simpledialog.askstring("Insert Filename", "Please insert the file Name for SMU2:")
+        run_sweep(sweep_points, user_input, user_input2)
+    else:
+        run_sweep(sweep_points, user_input)
+    ui.sweep_window.destroy()
+    k.smua.source.output = 0
+    k2.smua.source.output = 0
+    global measurement
+    measurement = 0
+
 def create_sweep():
     global measurement 
     measurement = 1
@@ -2975,47 +3100,6 @@ def create_sweep():
         k.smua.sense = k.smua.SENSE_REMOTE
     else:
         k.smua.sense = k.smua.SENSE_LOCAL
-    def add_section():
-        frame = create_section_frame(sections_frame)
-        frame.pack(fill=tk.X)
-        section_frames.append(frame)
-
-    def run():
-        sweep_points = []
-        total_steps = 0
-        for frame in section_frames:
-            try:
-                start_value = frame.winfo_children()[1].get()
-                end_value = frame.winfo_children()[3].get()
-                steps_value = frame.winfo_children()[5].get()
-                print(f"Start: {start_value}, End: {end_value}, Steps: {steps_value}")  # Debugging-Information
-                start = float(start_value)
-                end = float(end_value)
-                steps = int(steps_value)
-                sweep_points.append((start, end, steps))
-                total_steps += steps
-            except ValueError:
-                print("Fehler")
-                tk.messagebox.showerror("Fehler", "Ungültige Eingabe")  # Fehlermeldung anzeigen
-                return  # Frühzeitig zurückkehren, um die Ausführung zu stoppen
-            except tk.TclError as e:
-                 #Handle the case where the frame was removed, and its widgets no longer exist
-                 if "bad window path name" not in str(e):
-                     raise e
-        if save_var.get():  # Only save the data if the checkbox is checked
-            save_sweep(sweep_points)
-        user_input = simpledialog.askstring("Insert Filename", "Please insert the file Name:")
-        use_smu2var = use_smu2_var.get()
-        if use_smu2var:  # Use get() to obtain the boolean value
-            user_input2 = simpledialog.askstring("Insert Filename", "Please insert the file Name for SMU2:")
-            run_sweep(sweep_points, user_input, user_input2)
-        else:
-            run_sweep(sweep_points, user_input)
-        sweep_window.destroy()  # Planen Sie die Zerstörung des Fensters im Haupt-Thread
-        k.smua.source.output = 0
-        k2.smua.source.output = 0
-        global measurement 
-        measurement = 0
     section_frames = []
     sweep_window = tk.Toplevel(root)
     sweep_window.title("Make new Voltage Sweep")
@@ -3023,12 +3107,19 @@ def create_sweep():
     sections_frame = tk.Frame(sweep_window)
     sections_frame.pack()
 
-    add_section()  # Fügen Sie einen Abschnitt hinzu, um zu beginnen
+    save_var = tk.IntVar()  # Create an IntVar to hold the state of the checkbox
+    ui = SweepUI(
+        section_frames=section_frames,
+        sections_frame=sections_frame,
+        save_var=save_var,
+        sweep_window=sweep_window,
+    )
+
+    _sweep_add_section(ui)  # Fügen Sie einen Abschnitt hinzu, um zu beginnen
 
     controls_frame = tk.Frame(sweep_window)
     controls_frame.pack(fill=tk.X)
 
-    save_var = tk.IntVar()  # Create an IntVar to hold the state of the checkbox
     save_checkbutton = tk.Checkbutton(controls_frame, text="Save Measurement Settings", variable=save_var)
     save_checkbutton.pack(side=tk.LEFT)  # Adjust the side argument as needed
     # Add the checkbox for Local/Remote measurement here
@@ -3036,8 +3127,8 @@ def create_sweep():
     local_remote_checkbox.pack(side=tk.LEFT)
     smu2_checkbox = tk.Checkbutton(controls_frame, text="Use SMU2", variable=use_smu2_var)
     smu2_checkbox.pack(side=tk.LEFT)
-    tk.Button(controls_frame, text="Add Section", command=add_section).pack(side=tk.LEFT)
-    tk.Button(controls_frame, text="Sweep start", command=run).pack(side=tk.RIGHT)
+    tk.Button(controls_frame, text="Add Section", command=partial(_sweep_add_section, ui)).pack(side=tk.LEFT)
+    tk.Button(controls_frame, text="Sweep start", command=partial(_sweep_run, ui)).pack(side=tk.RIGHT)
     return sweep_window, section_frames, sections_frame
 
 def start_sweep_thread(action):
@@ -3063,109 +3154,115 @@ def create_temp_frame(parent):
     tk.Button(frame, text="Remove", command=frame.destroy).grid(row=1, column=2)
     return frame
 
+@dataclass
+class IVTempGridState:
+    row: int = 0
+    col: int = 0
+
+@dataclass
+class IVTempUI:
+    iv_section_frames: list
+    temp_section_frames: list
+    iv_sections_frame: object
+    temp_sections_frame: object
+    grid_state: IVTempGridState
+    iv_temp_window: object
+
+def _iv_temp_add_iv_section(ui: IVTempUI):
+    frame = create_section_frame(ui.iv_sections_frame)
+    frame.grid(row=len(ui.iv_section_frames), column=0, padx=10, pady=10)
+    ui.iv_section_frames.append(frame)
+
+def _iv_temp_add_temp_section(ui: IVTempUI):
+    frame = create_temp_frame(ui.temp_sections_frame)
+    frame.grid(row=ui.grid_state.row, column=ui.grid_state.col, padx=10, pady=10)
+    ui.temp_section_frames.append(frame)
+    ui.grid_state.row += 1
+    if ui.grid_state.row >= 10:
+        ui.grid_state.row = 0
+        ui.grid_state.col += 1
+
+def _iv_temp_run(ui: IVTempUI):
+    sweep_data = []
+    for frame in ui.iv_section_frames:
+        try:
+            start_value = frame.winfo_children()[1].get()
+            end_value = frame.winfo_children()[3].get()
+            steps_value = frame.winfo_children()[5].get()
+            start = float(start_value)
+            end = float(end_value)
+            steps = int(steps_value)
+            sweep_data.append((start, end, steps))
+        except ValueError:
+            tk.messagebox.showerror("Error", "Invalid input")
+            return
+        except tk.TclError as e:
+            if "bad window path name" not in str(e):
+                raise e
+
+    temperature_data = []
+    for frame in ui.temp_section_frames:
+        try:
+            start_temp_value = frame.winfo_children()[1].get()
+            start_temp_value = float(start_temp_value)
+            if 0.2 < start_temp_value < 290:
+                None
+            else:
+                Errormessage("Out of Value Range 0.2-290K")
+                if start_temp_value > 290:
+                    start_temp_value = 290
+                else:
+                    start_temp_value = 0.2
+            ramp_speed_value = frame.winfo_children()[3].get()
+            start_temp = float(start_temp_value)
+            ramp_speed = float(ramp_speed_value)
+            temperature_data.append((start_temp, ramp_speed))
+        except ValueError:
+            tk.messagebox.showerror("Error", "Invalid input")
+            return
+        except tk.TclError as e:
+            if "bad window path name" not in str(e):
+                raise e
+    user_input = simpledialog.askstring("Insert Filename", "Please insert the file Name:")
+
+    for start_temp, ramp_speed in temperature_data:
+        temperature_control.start((start_temp, ramp_speed))
+        while abs(client.query('T_sample.kelvin') - start_temp) > 0.01:
+            time.sleep(0.2)
+        time.sleep(60)
+        temperature_str = str(client.query('T_sample.kelvin') or 300)
+        user_input_temperature = user_input + "_" + temperature_str + "K" + "_"
+        run_sweep(sweep_data, user_input_temperature)
+    temperature_control.stop()
+
+    ui.iv_temp_window.destroy()
+    k.smua.source.output = 0
+    k2.smua.source.output = 0
+    global measurement
+    measurement = 0
+
 def IV_Temp():
     global measurement 
     measurement = 1
-    def add_iv_section():
-        frame = create_section_frame(iv_sections_frame)
-        frame.grid(row=len(iv_section_frames), column=0, padx=10, pady=10)
-        iv_section_frames.append(frame)
-
-    def add_temp_section():
-        nonlocal current_temp_row, current_temp_col
-        frame = create_temp_frame(temp_sections_frame)
-        frame.grid(row=current_temp_row, column=current_temp_col, padx=10, pady=10)
-        temp_section_frames.append(frame)
-        current_temp_row += 1
-        if current_temp_row >= 10:
-            current_temp_row = 0
-            current_temp_col += 1
-
-    # Initialize row and column index for temperature sections
-    current_temp_row = 0
-    current_temp_col = 0
-
-
-    def run():
-        # Collect IV sweep data (start, end, steps) from the GUI
-        sweep_data = []
-        for frame in iv_section_frames:
-            try:
-                start_value = frame.winfo_children()[1].get()
-                end_value = frame.winfo_children()[3].get()
-                steps_value = frame.winfo_children()[5].get()
-                start = float(start_value)
-                end = float(end_value)
-                steps = int(steps_value)
-                sweep_data.append((start, end, steps))
-            except ValueError:
-                tk.messagebox.showerror("Error", "Invalid input")
-                return
-            except tk.TclError as e:
-                 #Handle the case where the frame was removed, and its widgets no longer exist
-                 if "bad window path name" not in str(e):
-                     raise e
-
-        # Collect temperature data (start_temp, end_temp, ramp_speed) from the GUI
-        temperature_data = []
-        for frame in temp_section_frames:
-            try:
-                start_temp_value = frame.winfo_children()[1].get()
-                start_temp_value = float(start_temp_value)
-                if 0.2 < start_temp_value <290:
-                    None
-                else:
-                    Errormessage("Out of Value Range 0.2-290K")
-                    if start_temp_value >290:
-                        start_temp_value = 290
-                    else:
-                        start_temp_value = 0.2
-                ramp_speed_value = frame.winfo_children()[3].get()
-                start_temp = float(start_temp_value)
-                ramp_speed = float(ramp_speed_value)
-                temperature_data.append((start_temp, ramp_speed))
-            except ValueError:
-                tk.messagebox.showerror("Error", "Invalid input")
-                return
-            except tk.TclError as e:
-                 #Handle the case where the frame was removed, and its widgets no longer exist
-                 if "bad window path name" not in str(e):
-                     raise e
-        user_input = simpledialog.askstring("Insert Filename", "Please insert the file Name:")
-
-        for start_temp, ramp_speed in temperature_data:
-            # Set the temperature using your temperature control mechanism
-            temperature_control.start((start_temp, ramp_speed))
-            # Wait until the target start temperature is reached within 0.01K certainty
-            while abs(client.query('T_sample.kelvin') - start_temp) > 0.01:
-                time.sleep(0.2)  # Wait for 0.2 seconds
-                
-            time.sleep(60)
-            # Perform the IV sweep using the run_sweep() function
-            # It's assumed that run_sweep() will use the current temperature in its measurements
-            temperature_str = str(client.query('T_sample.kelvin') or 300)
-            user_input_temperature = user_input + "_" + temperature_str + "K" + "_"
-            run_sweep(sweep_data,user_input_temperature)
-        temperature_control.stop()
-            
-        iv_temp_window.destroy()
-        k.smua.source.output = 0
-        k2.smua.source.output = 0
-        global measurement 
-        measurement = 0
-        
     iv_temp_window = tk.Toplevel(root)
     iv_temp_window.title("IV Sweep at Different Temperatures")
     iv_temp_window.protocol("WM_DELETE_WINDOW", lambda: on_closing(iv_temp_window))
     iv_sections_frame = tk.Frame(iv_temp_window)
     iv_sections_frame.pack()
-
-    add_iv_section()  # Add one section to begin with for IV sweep data
-
     temp_sections_frame = tk.Frame(iv_temp_window)
     temp_sections_frame.pack()
 
-    add_temp_section()  # Add one section to begin with for temperature data
+    ui = IVTempUI(
+        iv_section_frames=iv_section_frames,
+        temp_section_frames=temp_section_frames,
+        iv_sections_frame=iv_sections_frame,
+        temp_sections_frame=temp_sections_frame,
+        grid_state=IVTempGridState(),
+        iv_temp_window=iv_temp_window,
+    )
+
+    _iv_temp_add_iv_section(ui)  # Add one section to begin with for IV sweep data
+    _iv_temp_add_temp_section(ui)  # Add one section to begin with for temperature data
 
     controls_frame = tk.Frame(iv_temp_window)
     controls_frame.pack(fill=tk.X)  # Use pack to place controls_frame correctly
@@ -3173,9 +3270,9 @@ def IV_Temp():
     local_remote_checkbox.pack(side=tk.LEFT)
     smu2_checkbox = tk.Checkbutton(controls_frame, text="Use SMU2", variable=use_smu2_var)
     smu2_checkbox.pack(side=tk.LEFT)
-    tk.Button(controls_frame, text="Add Section (IV)", command=add_iv_section).pack(side=tk.LEFT)
-    tk.Button(controls_frame, text="Add Section (Temp)", command=add_temp_section).pack(side=tk.LEFT)
-    tk.Button(controls_frame, text="Measurement start", command=run).pack(side=tk.RIGHT)
+    tk.Button(controls_frame, text="Add Section (IV)", command=partial(_iv_temp_add_iv_section, ui)).pack(side=tk.LEFT)
+    tk.Button(controls_frame, text="Add Section (Temp)", command=partial(_iv_temp_add_temp_section, ui)).pack(side=tk.LEFT)
+    tk.Button(controls_frame, text="Measurement start", command=partial(_iv_temp_run, ui)).pack(side=tk.RIGHT)
 
     return iv_temp_window  # Return the window to keep it open
 
@@ -3186,135 +3283,140 @@ temp_section_frames = []  # List to hold the frames for temperature data
 #%% Cell 7: 4 Point Tc Measurement Force
 #4PointTcMeasurement
 
+@dataclass
+class Tc4ptUI:
+    sections_frame: object
+    section_frames: list
+    measurement_started: object
+    tc_window: object
+    temperature_data: list
+    resistance_data: list
+
+def _tc4pt_add_section(ui: Tc4ptUI):
+    frame = create_tc_frame(ui.sections_frame)
+    frame.pack(fill=tk.X)
+    ui.section_frames.append(frame)
+
+def _tc4pt_update_plot(temp_data, resistance_data, line, ax, fig, _frame):
+    line.set_data(temp_data, resistance_data)
+    ax.relim()
+    ax.autoscale_view()
+    fig.canvas.flush_events()
+
+def _tc4pt_get_data(ui: Tc4ptUI):
+    tc_data = []
+    maximumProgress = 0
+    offset = 0
+    for frame in ui.section_frames:
+        try:
+            start_temp = float(frame.winfo_children()[1].get())
+            end_temp = float(frame.winfo_children()[3].get())
+            ramp_speed = float(frame.winfo_children()[5].get())
+            ramp_current = float(frame.winfo_children()[7].get()) / 1000000
+            tc_data.append((start_temp, end_temp, ramp_speed, ramp_current))
+            maximumProgress = maximumProgress + abs(end_temp - start_temp)
+        except ValueError:
+            print("Fehler")
+            tk.messagebox.showerror("Fehler", "Ungültige Eingabe")
+            return
+        except tk.TclError as e:
+            if "bad window path name" not in str(e):
+                raise e
+    print(tc_data)
+
+    progress_window = tk.Toplevel(root)
+    progress_window.title("Tc 4 Point Measurement Progress")
+    progress_bar = ttk.Progressbar(progress_window, maximum=maximumProgress, length=300)
+    progress_bar.pack(padx=20, pady=20)
+    progress_window.update()
+    global rt
+    rt = ResultTable(
+        column_titles=['Time', 'Current [A]', 'Voltage[V]','Temperature[K]'],
+        units=[' ', "A", 'V','K'],
+        params={'recorded': time.asctime(), 'sweep_type': 'tc'},
+    )
+    global rt2
+    rt2 = ResultTable(
+        column_titles=['Time', 'Current [A]', 'Voltage[V]','Temperature[K]'],
+        units=[' ', "A", 'V','K'],
+        params={'recorded': time.asctime(), 'sweep_type': 'tc'},
+    )
+    user_input = simpledialog.askstring("Insert Filename", "Please insert the file Name:")
+    NameWindow = str(user_input) + str(client.query('T_sample.kelvin') or 300)
+    plot_window, fig, ax, line = create_plot_window_for_Resistance(NameWindow)
+    ani = FuncAnimation(fig, partial(_tc4pt_update_plot, ui.temperature_data, ui.resistance_data, line, ax, fig),
+                        frames=10000, repeat=False, interval=5000)
+    ani._start()
+    for start_temp, end_temp, ramp_speed, ramp_current in tc_data:
+        if start_temp + 5 < temperature_control.kelvin and start_temp > 5:
+            temperature_control.stop()
+        else:
+            temperature_control.start((start_temp, ramp_speed))
+        if ui.measurement_started.get() == 1:
+            temperature_control.start((end_temp, ramp_speed))
+            k.smua.source.output = 1
+            k.smua.source.func = 2
+            k2.smua.source.output = 1
+            k2.smua.source.func = 2
+            k.apply_current(k.smua, ramp_current)
+            k2.apply_current(k2.smua, 0)
+            while abs(client.query('T_sample.kelvin') - start_temp) > 0.1:
+                voltage = k2.smua.measure.v()
+                voltage2 = k.smua.measure.v()
+                timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                temperature = temperature_control.kelvin
+                ui.temperature_data.append(temperature)
+                ui.resistance_data.append(voltage / ramp_current)
+                rt.append_row([timestamp, ramp_current, voltage, temperature])
+                rt2.append_row([timestamp, ramp_current, voltage2, temperature])
+                time.sleep(0.2)
+        else:
+            while abs(client.query('T_sample.kelvin') - start_temp) > 0.1:
+                time.sleep(0.2)
+            temperature_control.start((end_temp, ramp_speed))
+            k.smua.source.output = 1
+            k.smua.source.func = 2
+            k2.smua.source.output = 1
+            k2.smua.source.func = 2
+            k.apply_current(k.smua, ramp_current)
+            k2.apply_current(k2.smua, 0)
+
+        while abs(client.query('T_sample.kelvin') - end_temp) > 0.01:
+            voltage = k2.smua.measure.v()
+            voltage2 = k.smua.measure.v()
+            timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            temperature = temperature_control.kelvin
+            ui.temperature_data.append(temperature)
+            ui.resistance_data.append(voltage / ramp_current)
+            rt.append_row([timestamp, ramp_current, voltage, temperature])
+            rt2.append_row([timestamp, ramp_current, voltage2, temperature])
+            progress_bar['value'] = abs(temperature - start_temp) + offset
+            progress_window.update()
+            time.sleep(0.2)
+        offset = offset + abs(end_temp - start_temp)
+
+    data_numeric = np.array([[timestamp] + list(map(float, values)) for timestamp, *values in rt.data])
+    safe_file(data_numeric, user_input)
+    data_numeric2 = np.array([[timestamp] + list(map(float, values)) for timestamp, *values in rt2.data])
+    user_input2 = user_input + "CurrentSMUVoltage"
+    safe_file(data_numeric2, user_input2)
+    ui.tc_window.destroy()
+    progress_window.destroy()
+    k.smua.source.output = 0
+    k2.smua.source.output = 0
+    global measurement
+    measurement = 0
+    try:
+        ani._stop()
+    except AttributeError:
+        pass
+
 # New function to create the 4p Tc measurement window
 def create_4ptc_measurement():
     global measurement 
     measurement = 1
     k.smua.sense = k.smua.SENSE_LOCAL
     k2.smua.sense = k2.smua.SENSE_LOCAL
-    def add_tc_section():
-        frame = create_tc_frame(sections_frame)
-        frame.pack(fill=tk.X)
-        section_frames.append(frame)
-    
-    def get_tc_data():
-        tc_data = []
-        maximumProgress = 0
-        offset=0
-        for frame in section_frames:
-            try:
-                start_temp = float(frame.winfo_children()[1].get())
-                end_temp = float(frame.winfo_children()[3].get())
-                ramp_speed = float(frame.winfo_children()[5].get())
-                ramp_current = float(frame.winfo_children()[7].get())/1000000
-                tc_data.append((start_temp, end_temp, ramp_speed, ramp_current))
-                maximumProgress = maximumProgress + abs(end_temp - start_temp)
-            except ValueError:
-                print("Fehler")
-                tk.messagebox.showerror("Fehler", "Ungültige Eingabe")  # Fehlermeldung anzeigen
-                return
-            except tk.TclError as e:
-                 #Handle the case where the frame was removed, and its widgets no longer exist
-                 if "bad window path name" not in str(e):
-                     raise e
-        print(tc_data)  # For debugging, print the collected data
-        
-        progress_window = tk.Toplevel(root)  # New window for the progress bar
-        progress_window.title("Tc 4 Point Measurement Progress")
-        progress_bar = ttk.Progressbar(progress_window, maximum=maximumProgress, length=300)
-        progress_bar.pack(padx=20, pady=20)
-        progress_window.update()  # Update the window to show the progress bar
-        global rt
-        rt = ResultTable(
-            column_titles=['Time', 'Current [A]', 'Voltage[V]','Temperature[K]'],
-            units=[' ', "A", 'V','K'],
-            params={'recorded': time.asctime(), 'sweep_type': 'tc'},
-        )
-        global rt2
-        rt2 = ResultTable(
-            column_titles=['Time', 'Current [A]', 'Voltage[V]','Temperature[K]'],
-            units=[' ', "A", 'V','K'],
-            params={'recorded': time.asctime(), 'sweep_type': 'tc'},
-        )
-        user_input = simpledialog.askstring("Insert Filename", "Please insert the file Name:")
-        NameWindow = str(user_input) + str(client.query('T_sample.kelvin') or 300)
-        plot_window, fig, ax, line = create_plot_window_for_Resistance(NameWindow)
-        def update_plot(_):
-            # Update the plot with new data
-            line.set_data(temperature_data, resistance_data)
-            ax.relim()
-            ax.autoscale_view()
-            fig.canvas.flush_events()
-        ani = FuncAnimation(fig, update_plot, frames=10000, repeat=False, interval=5000)
-        ani._start()
-        for start_temp, end_temp, ramp_speed, ramp_current in tc_data:
-            # Set initial temperature
-            if start_temp+5<temperature_control.kelvin and start_temp >5:
-                temperature_control.stop()
-            else:    
-                temperature_control.start((start_temp, ramp_speed))
-            # Wait until the target start temperature is reached within 0.01K certainty
-            if measurement_started.get() == 1:
-                temperature_control.start((end_temp, ramp_speed))# Apply current continuously and measure voltage until target end temperature is reached within 0.01K certainty
-                k.smua.source.output = 1
-                k.smua.source.func = 2
-                k2.smua.source.output = 1
-                k2.smua.source.func = 2
-                k.apply_current(k.smua, ramp_current)  # Apply the current
-                k2.apply_current(k2.smua, 0)
-                while abs(client.query('T_sample.kelvin') - start_temp) > 0.1:
-                    voltage = k2.smua.measure.v()  # Measure the voltage
-                    voltage2 = k.smua.measure.v()
-                    timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')  # Get the current time
-                    temperature = temperature_control.kelvin # Get the current temperature
-                    temperature_data.append(temperature)
-                    resistance_data.append(voltage / ramp_current)  # Calculate resistance from voltage and current               
-                    rt.append_row([timestamp,ramp_current, voltage, temperature])  # Append data to the ResultTable
-                    rt2.append_row([timestamp,ramp_current, voltage2, temperature])  # Append data to the ResultTable
-                    time.sleep(0.2)  # Wait for 0.1 seconds
-            else:
-                while abs(client.query('T_sample.kelvin') - start_temp) > 0.1:
-                    time.sleep(0.2)  # Wait for 0.1 seconds
-                temperature_control.start((end_temp, ramp_speed))# Apply current continuously and measure voltage until target end temperature is reached within 0.01K certainty
-                k.smua.source.output = 1
-                k.smua.source.func = 2
-                k2.smua.source.output = 1
-                k2.smua.source.func = 2
-                k.apply_current(k.smua, ramp_current)  # Apply the current
-                k2.apply_current(k2.smua, 0)
-            # Set the next temperature
-
-            while abs(client.query('T_sample.kelvin') - end_temp) > 0.01:                
-                voltage = k2.smua.measure.v()  # Measure the voltage
-                voltage2 = k.smua.measure.v()
-                timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')  # Get the current time
-                temperature = temperature_control.kelvin # Get the current temperature
-                temperature_data.append(temperature)
-                resistance_data.append(voltage / ramp_current)  # Calculate resistance from voltage and current               
-                rt.append_row([timestamp,ramp_current, voltage, temperature])  # Append data to the ResultTable
-                rt2.append_row([timestamp,ramp_current, voltage2, temperature])  # Append data to the ResultTable
-                progress_bar['value'] = abs(temperature - start_temp)+offset  # Update the progress bar
-                progress_window.update()  # Update the window to show the progress
-                time.sleep(0.2)  # Wait for 0.2 seconds
-            offset=offset+abs(end_temp - start_temp)
-            
-        
-        # Format the data for saving
-        data_numeric = np.array([[timestamp] + list(map(float, values)) for timestamp, *values in rt.data])
-        safe_file(data_numeric,user_input)
-        data_numeric2 = np.array([[timestamp] + list(map(float, values)) for timestamp, *values in rt2.data])
-        user_input2= user_input + "CurrentSMUVoltage"
-        safe_file(data_numeric2,user_input2)
-        tc_window.destroy()
-        progress_window.destroy()  # Close the progress window
-        k.smua.source.output = 0
-        k2.smua.source.output = 0
-        global measurement 
-        measurement = 0
-        try:
-            ani._stop()
-        except AttributeError:
-            pass  # Ignore the AttributeError if animation has already run through
     section_frames = []
 
     global temperature_data
@@ -3329,15 +3431,24 @@ def create_4ptc_measurement():
     sections_frame = tk.Frame(tc_window)
     sections_frame.grid(row=0, column=0, padx=10, pady=10)
 
-    add_tc_section()  # Add one section to begin with
+    ui = Tc4ptUI(
+        sections_frame=sections_frame,
+        section_frames=section_frames,
+        measurement_started=measurement_started,
+        tc_window=tc_window,
+        temperature_data=temperature_data,
+        resistance_data=resistance_data,
+    )
+
+    _tc4pt_add_section(ui)  # Add one section to begin with
 
     controls_frame = tk.Frame(tc_window)
     controls_frame.grid(row=1, column=0, padx=10, pady=10)
 
     # Place the Checkbutton and buttons in the controls_frame using grid
     tk.Checkbutton(controls_frame, text="Start Measurement", variable=measurement_started).grid(row=0, column=0, columnspan=2)
-    tk.Button(controls_frame, text="Add Section", command=add_tc_section).grid(row=0, column=2)
-    tk.Button(controls_frame, text="Measurement start", command=get_tc_data).grid(row=0, column=3)
+    tk.Button(controls_frame, text="Add Section", command=partial(_tc4pt_add_section, ui)).grid(row=0, column=2)
+    tk.Button(controls_frame, text="Measurement start", command=partial(_tc4pt_get_data, ui)).grid(row=0, column=3)
     
     # Additional widgets or layout adjustments can be made here if needed
     
@@ -3349,141 +3460,143 @@ def create_4ptc_measurement():
 #%% Cell 8: 4 Point Tc Measurement with Sense
 #4PT Sense
 
+@dataclass
+class TcSenseUI:
+    sections_frame: object
+    section_frames: list
+    measurement_started: object
+    tc_window: object
+
+def _tc_sense_add_section(ui: TcSenseUI):
+    frame = create_tc_frame(ui.sections_frame)
+    frame.pack(fill=tk.X)
+    ui.section_frames.append(frame)
+
+def _tc_sense_update_plot(temp_data, resistance_data, line, ax, fig, _frame):
+    if temp_data:
+        line.set_data(temp_data, resistance_data)
+        ax.relim()
+        ax.autoscale_view()
+        fig.canvas.flush_events()
+
+def _tc_sense_get_data(ui: TcSenseUI):
+    tc_data = []
+    maximumProgress = 0
+    offset = 0
+    for frame in ui.section_frames:
+        try:
+            start_temp = float(frame.winfo_children()[1].get())
+            if 0.08 < start_temp < 290:
+                None
+            else:
+                Errormessage("Out of Value Range 0.2-290K")
+                if start_temp > 290:
+                    start_temp = 290
+                else:
+                    start_temp = 0.2
+            end_temp = float(frame.winfo_children()[3].get())
+            if 0.08 < end_temp < 290:
+                None
+            else:
+                Errormessage("Out of Value Range 0.2-290K")
+                if end_temp > 290:
+                    end_temp = 290
+                else:
+                    end_temp = 0.2
+            ramp_speed = float(frame.winfo_children()[5].get())
+            ramp_current = float(frame.winfo_children()[7].get()) / 1000000
+            tc_data.append((start_temp, end_temp, ramp_speed, ramp_current))
+            maximumProgress = maximumProgress + abs(end_temp - start_temp)
+        except ValueError:
+            print("Fehler")
+            tk.messagebox.showerror("Fehler", "Ungültige Eingabe")
+            return
+        except tk.TclError as e:
+            if "bad window path name" not in str(e):
+                raise e
+
+    print(tc_data)
+    progress_window = tk.Toplevel(root)
+    progress_window.title("4P Sense Measurement Progress")
+    progress_bar = ttk.Progressbar(progress_window, maximum=maximumProgress, length=300)
+    progress_bar.pack(padx=20, pady=20)
+    progress_window.update()
+    global rt
+    rt = ResultTable(
+        column_titles=['Time',  'Current [A]','Voltage[V]','Temperature[K]'],
+        units=[' ',  'V',"A",'K'],
+        params={'recorded': time.asctime(), 'sweep_type': 'tc'},
+    )
+    user_input = simpledialog.askstring("Insert Filename", "Please insert the file Name:")
+    NameWindow = str(user_input)
+    plot_window, fig, ax, line = create_plot_window_for_Resistance(NameWindow)
+
+    Temp_data = []
+    Resistance_data = []
+
+    ani = FuncAnimation(fig, partial(_tc_sense_update_plot, Temp_data, Resistance_data, line, ax, fig),
+                        frames=10000, repeat=False, interval=5000)
+    ani._start()
+    for start_temp, end_temp, ramp_speed, ramp_current in tc_data:
+        if start_temp + 5 < temperature_control.kelvin and start_temp > 5:
+            pass
+        else:
+            temperature_control.start((start_temp, ramp_speed))
+        if ui.measurement_started.get() == 1:
+            temperature_control.start((end_temp, ramp_speed))
+            k.smua.source.output = 1
+            k.smua.source.func = 2
+            k.apply_current(k.smua, ramp_current)
+
+            while abs(client.query('T_sample.kelvin') - start_temp) > 0.1:
+                current, voltage = k.smua.measure.iv()
+                timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                temperature = temperature_control.kelvin
+                Temp_data.append(temperature)
+                rt.append_row([timestamp, current, voltage, temperature])
+                Resistance_data.append(voltage / current)
+                progress_bar['value'] = abs(temperature - start_temp) + offset
+                progress_window.update()
+                time.sleep(0.2)
+        else:
+            while abs(client.query('T_sample.kelvin') - start_temp) > 0.1:
+                time.sleep(0.2)
+            temperature_control.start((end_temp, ramp_speed))
+            k.smua.source.output = 1
+            k.smua.source.func = 2
+            k.apply_current(k.smua, ramp_current)
+
+        while abs(client.query('T_sample.kelvin') - end_temp) > 0.01:
+            current, voltage = k.smua.measure.iv()
+            timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            temperature = temperature_control.kelvin
+            Temp_data.append(temperature)
+            rt.append_row([timestamp, current, voltage, temperature])
+            Resistance_data.append(voltage / current)
+            progress_bar['value'] = abs(temperature - start_temp) + offset
+            progress_window.update()
+            time.sleep(0.2)
+        offset = offset + abs(end_temp - start_temp)
+
+    data_numeric = np.array([[timestamp] + list(map(float, values)) for timestamp, *values in rt.data])
+    safe_file(data_numeric, user_input)
+    ui.tc_window.destroy()
+    progress_window.destroy()
+    k.smua.source.output = 0
+    k2.smua.source.output = 0
+    global measurement
+    measurement = 0
+    try:
+        ani._stop()
+    except AttributeError:
+        pass
+
 
 # New function to create the Tc measurement window
 def create_4pt_measurement_Sense():
     global measurement 
     measurement = 1
     k.smua.sense = k.smua.SENSE_REMOTE
-    def add_tc_section():
-        frame = create_tc_frame(sections_frame)
-        frame.pack(fill=tk.X)
-        section_frames.append(frame)
-    
-    def get_tc_data():
-        tc_data = []
-        maximumProgress = 0
-        offset=0
-        for frame in section_frames:
-            try:
-                start_temp = float(frame.winfo_children()[1].get())
-                if 0.08<start_temp <290:
-                    None
-                else:
-                    Errormessage("Out of Value Range 0.2-290K")
-                    if start_temp >290:
-                        start_temp = 290
-                    else:
-                        start_temp = 0.2
-                end_temp = float(frame.winfo_children()[3].get())
-                if 0.08<end_temp <290:
-                    None
-                else:
-                    Errormessage("Out of Value Range 0.2-290K")
-                    if end_temp >290:
-                        end_temp = 290
-                    else:
-                        end_temp = 0.2
-                ramp_speed = float(frame.winfo_children()[5].get())
-                ramp_current = float(frame.winfo_children()[7].get())/1000000
-                tc_data.append((start_temp, end_temp, ramp_speed, ramp_current))
-                maximumProgress = maximumProgress + abs(end_temp - start_temp)
-            except ValueError:
-                print("Fehler")
-                tk.messagebox.showerror("Fehler", "Ungültige Eingabe")  # Fehlermeldung anzeigen
-                return
-            except tk.TclError as e:
-                 #Handle the case where the frame was removed, and its widgets no longer exist
-                 if "bad window path name" not in str(e):
-                     raise e
-            
-        print(tc_data)  # For debugging, print the collected data
-        progress_window = tk.Toplevel(root)  # New window for the progress bar
-        progress_window.title("4P Sense Measurement Progress")
-        progress_bar = ttk.Progressbar(progress_window, maximum=maximumProgress, length=300)
-        progress_bar.pack(padx=20, pady=20)
-        progress_window.update()  # Update the window to show the progress bar
-        global rt
-        rt = ResultTable(
-            column_titles=['Time',  'Current [A]','Voltage[V]','Temperature[K]'],
-            units=[' ',  'V',"A",'K'],
-            params={'recorded': time.asctime(), 'sweep_type': 'tc'},
-        )
-        user_input = simpledialog.askstring("Insert Filename", "Please insert the file Name:")
-        NameWindow = str(user_input)
-        plot_window, fig, ax, line = create_plot_window_for_Resistance(NameWindow)
-        
-        Temp_data=[]
-        Resistance_data=[]
-        
-        def update_R_plot(_):
-            nonlocal Temp_data
-            nonlocal Resistance_data
-            if Temp_data:
-                Temp_values, Resistance_values = Temp_data,Resistance_data
-                line.set_data(Temp_values, Resistance_values)
-                ax.relim()
-                ax.autoscale_view()
-                fig.canvas.flush_events()
-        ani = FuncAnimation(fig, update_R_plot, frames=10000, repeat=False, interval=5000)
-        ani._start()
-        for start_temp, end_temp, ramp_speed, ramp_current in tc_data:
-            # Set initial temperature
-            if start_temp+5<temperature_control.kelvin and start_temp >5:
-                pass
-            else:    
-                temperature_control.start((start_temp, ramp_speed))
-            # Wait until the target start temperature is reached within 0.01K certainty
-            if measurement_started.get() == 1:
-                temperature_control.start((end_temp, ramp_speed))# Apply current continuously and measure voltage until target end temperature is reached within 0.01K certainty
-                k.smua.source.output = 1
-                k.smua.source.func = 2
-                k.apply_current(k.smua, ramp_current)  # Apply the current
-                
-                while abs(client.query('T_sample.kelvin') - start_temp) > 0.1:
-                    current, voltage = k.smua.measure.iv()  # Measure the voltage
-                    timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')  # Get the current time
-                    temperature = temperature_control.kelvin # Get the current temperature
-                    Temp_data.append(temperature)
-                    rt.append_row([timestamp, current,voltage, temperature])  # Append data to the ResultTable
-                    Resistance_data.append(voltage/current)
-                    progress_bar['value'] = abs(temperature - start_temp)+offset  # Update the progress bar
-                    progress_window.update()  # Update the window to show the progress
-                    time.sleep(0.2)  # Wait for 0.1 seconds
-            else:
-                while abs(client.query('T_sample.kelvin') - start_temp) > 0.1:
-                    time.sleep(0.2)  # Wait for 0.1 seconds
-                temperature_control.start((end_temp, ramp_speed))# Apply current continuously and measure voltage until target end temperature is reached within 0.01K certainty
-                k.smua.source.output = 1
-                k.smua.source.func = 2
-                k.apply_current(k.smua, ramp_current)  # Apply the current
-                    
-            # Set the next temperature
-
-            while abs(client.query('T_sample.kelvin') - end_temp) > 0.01:                
-                current, voltage = k.smua.measure.iv()  # Measure the voltage
-                timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')  # Get the current time
-                temperature = temperature_control.kelvin # Get the current temperature
-                Temp_data.append(temperature)
-                rt.append_row([timestamp, current,voltage, temperature])  # Append data to the ResultTable
-                Resistance_data.append(voltage/current)
-                progress_bar['value'] = abs(temperature - start_temp)+offset  # Update the progress bar
-                progress_window.update()  # Update the window to show the progress
-                time.sleep(0.2)  # Wait for 0.2 seconds
-            offset=offset+abs(end_temp - start_temp)
-        # Format the data for saving
-        data_numeric = np.array([[timestamp] + list(map(float, values)) for timestamp, *values in rt.data])
-        safe_file(data_numeric,user_input)
-        tc_window.destroy()
-        progress_window.destroy()  # Close the progress window
-        k.smua.source.output = 0
-        k2.smua.source.output = 0
-        global measurement 
-        measurement = 0
-        try:
-            ani._stop()
-        except AttributeError:
-            pass  # Ignore the AttributeError if animation has already run through
     section_frames = []
     tc_window = tk.Toplevel(root)
     tc_window.title("Tc Measurement")
@@ -3492,19 +3605,22 @@ def create_4pt_measurement_Sense():
     sections_frame = tk.Frame(tc_window)
     sections_frame.grid(row=0, column=0, padx=10, pady=10)
 
-    add_tc_section()  # Add one section to begin with
+    ui = TcSenseUI(
+        sections_frame=sections_frame,
+        section_frames=section_frames,
+        measurement_started=measurement_started,
+        tc_window=tc_window,
+    )
+
+    _tc_sense_add_section(ui)  # Add one section to begin with
 
     controls_frame = tk.Frame(tc_window)
     controls_frame.grid(row=1, column=0, padx=10, pady=10)
 
-    # Place the Checkbutton and buttons in the controls_frame using grid
     tk.Checkbutton(controls_frame, text="Start Measurement", variable=measurement_started).grid(row=0, column=0, columnspan=2)
-    tk.Button(controls_frame, text="Add Section", command=add_tc_section).grid(row=0, column=2)
-    tk.Button(controls_frame, text="Measurement start", command=get_tc_data).grid(row=0, column=3)
-    
-    # Additional widgets or layout adjustments can be made here if needed
-    
-    # Optionally, set column and row weights to control resizing behavior
+    tk.Button(controls_frame, text="Add Section", command=partial(_tc_sense_add_section, ui)).grid(row=0, column=2)
+    tk.Button(controls_frame, text="Measurement start", command=partial(_tc_sense_get_data, ui)).grid(row=0, column=3)
+
     tc_window.columnconfigure(0, weight=1)
     tc_window.rowconfigure(0, weight=1)
 
