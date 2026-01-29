@@ -281,7 +281,7 @@ DEFAULTS = {
     "log_anchor_mode":           True,
 
     # Burst control (Queue-full vermeiden, Speed behalten)
-    "burst_ops_before_wait":     0,   # wie viele Kommandos vor waitcomplete()
+    "burst_ops_before_wait":     25,   # wie viele Kommandos vor waitcomplete()
     "burst_backoff_s":           0.02,  # kurze Pause nach Queue-full
 }
 
@@ -433,6 +433,20 @@ def _recover_queue_full(dev, ex, *, which='k'):
             global _burst_counter_k2; _burst_counter_k2 = 0
         return True
     return False
+
+def _queue_safe_call(dev, which, op, *, retries=2, fallback=None):
+    """Retry op on -350 queue full errors and return fallback on final failure."""
+    for attempt in range(int(retries) + 1):
+        try:
+            return op()
+        except Exception as ex:
+            if _recover_queue_full(dev, ex, which=which):
+                continue
+            if attempt >= int(retries):
+                if fallback is not None:
+                    return fallback
+                raise
+    return fallback
 
 # -------- Helpers (paths, saving, timing, plotting) --------
 def _get_primary_path():
@@ -631,52 +645,49 @@ def _junction_pulse_measure_v(I_uA, pulse_width_s, pulse_settle_s, cooldown_s):
     Level nach Messung wieder 0, Output AUS. Nutzt leveli statt apply_current().
     """
     I_A = float(I_uA) * 1e-6
-    try:
-        # Modus/Limit setzen (idempotent) und Ausgang EIN
-        k.smua.source.func   = 2           # current
-        k.smua.source.limitv = 0.01
-        k.smua.source.output = 1
-        _maybe_wait(k, which='k')
-    except Exception as ex:
-        if not _recover_queue_full(k, ex, which='k'):
-            raise
-        # retry
-        k.smua.source.func   = 2
-        k.smua.source.limitv = 0.01
-        k.smua.source.output = 1
+    _queue_safe_call(
+        k, 'k',
+        lambda: (
+            setattr(k.smua.source, "func", 2),  # current
+            setattr(k.smua.source, "limitv", 0.01),
+            setattr(k.smua.source, "output", 1),
+            _maybe_wait(k, which='k')
+        ),
+        retries=2
+    )
 
     # Level setzen
-    try:
-        k.smua.source.leveli = I_A
-        _maybe_wait(k, which='k')
-    except Exception as ex:
-        if not _recover_queue_full(k, ex, which='k'):
-            raise
-        k.smua.source.leveli = I_A
+    _queue_safe_call(
+        k, 'k',
+        lambda: (setattr(k.smua.source, "leveli", I_A), _maybe_wait(k, which='k')),
+        retries=2
+    )
 
     if pulse_settle_s > 0:
         time.sleep(pulse_settle_s)
 
     # Spannung messen
-    try:
-        v = k.smua.measure.v()
-    except Exception as ex:
-        if _recover_queue_full(k, ex, which='k'):
-            v = k.smua.measure.v()
-        else:
-            v = float('nan')
+    v = _queue_safe_call(
+        k, 'k',
+        lambda: k.smua.measure.v(),
+        retries=2,
+        fallback=float('nan')
+    )
 
     remain = max(0.0, pulse_width_s - pulse_settle_s)
     if remain > 0:
         time.sleep(remain)
 
     # Ausgang und Level zurücknehmen (wirklich aus!)
-    try:
-        k.smua.source.leveli = 0.0
-        k.smua.source.output = 0
-        _maybe_wait(k, which='k')
-    except Exception:
-        pass
+    _queue_safe_call(
+        k, 'k',
+        lambda: (
+            setattr(k.smua.source, "leveli", 0.0),
+            setattr(k.smua.source, "output", 0),
+            _maybe_wait(k, which='k')
+        ),
+        retries=1
+    )
 
     if cooldown_s > 0:
         time.sleep(cooldown_s)
@@ -870,17 +881,16 @@ except NameError:
 def _coil_set_current_uA(target_uA, ramp_steps, settle_s):
     """Coil (SMU2=k2) setzen, Queue-sicher; sehr kleine Steps zusammenfassen."""
     # Sicherstellen: Current-Mode, Output EIN
-    try:
-        k2.smua.source.func   = 2  # current
-        k2.smua.source.limitv = 10.0
-        k2.smua.source.output = 1
-        _maybe_wait(k2, which='k2')
-    except Exception as ex:
-        if not _recover_queue_full(k2, ex, which='k2'):
-            raise
-        k2.smua.source.func   = 2
-        k2.smua.source.limitv = 10.0
-        k2.smua.source.output = 1
+    _queue_safe_call(
+        k2, 'k2',
+        lambda: (
+            setattr(k2.smua.source, "func", 2),
+            setattr(k2.smua.source, "limitv", 10.0),
+            setattr(k2.smua.source, "output", 1),
+            _maybe_wait(k2, which='k2')
+        ),
+        retries=2
+    )
 
     target_uA = float(target_uA)
     ramp_steps = int(max(1, ramp_steps))
@@ -893,22 +903,20 @@ def _coil_set_current_uA(target_uA, ramp_steps, settle_s):
             ramp_steps = max(1, int(abs(target_uA) / min_increment_uA))
 
     if ramp_steps <= 1:
-        try:
-            k2.smua.source.leveli = target_uA * 1e-6
-            _maybe_wait(k2, which='k2')
-        except Exception as ex:
-            if not _recover_queue_full(k2, ex, which='k2'):
-                raise
-            k2.smua.source.leveli = target_uA * 1e-6
+        _queue_safe_call(
+            k2, 'k2',
+            lambda: (setattr(k2.smua.source, "leveli", target_uA * 1e-6),
+                     _maybe_wait(k2, which='k2')),
+            retries=2
+        )
     else:
         for frac in np.linspace(0.0, 1.0, ramp_steps):
-            try:
-                k2.smua.source.leveli = (frac * target_uA) * 1e-6
-                _maybe_wait(k2, which='k2')
-            except Exception as ex:
-                if not _recover_queue_full(k2, ex, which='k2'):
-                    raise
-                k2.smua.source.leveli = (frac * target_uA) * 1e-6
+            _queue_safe_call(
+                k2, 'k2',
+                lambda: (setattr(k2.smua.source, "leveli", (frac * target_uA) * 1e-6),
+                         _maybe_wait(k2, which='k2')),
+                retries=2
+            )
 
     if settle_s > 0:
         time.sleep(settle_s)
