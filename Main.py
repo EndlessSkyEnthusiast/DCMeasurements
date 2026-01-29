@@ -211,6 +211,9 @@ DEFAULTS = {
     "coil_step_mA":              1.0,           # linear step
     "coil_start_mA":             0.0,           # Startstrom für Resume/Anchor
 
+    # Temperature target
+    "target_temp_K":             "",
+
     # Ic threshold & timing
     "v_thresh":                  2e-4,          # |V| >= 2e-4 V => switched
     "nplc":                      0.01,
@@ -1221,6 +1224,17 @@ def _add_common_entries_with_start(frame, row0=0):
     tk.Label(frame, text="Start coil (mA)").grid(row=row0, column=0, padx=4, pady=2, sticky="e")
     e0s = tk.Entry(frame, width=10); e0s.insert(0, str(DEFAULTS["coil_start_mA"]))
     e0s.grid(row=row0, column=1); e["coil_start_mA"] = e0s
+    tk.Label(frame, text="Target T (K)").grid(row=row0, column=2, padx=4, pady=2, sticky="e")
+    e0t = tk.Entry(frame, width=10); e0t.insert(0, str(DEFAULTS["target_temp_K"]))
+    e0t.grid(row=row0, column=3); e["target_temp_K"] = e0t
+
+def _parse_target_temp(raw_value):
+    if raw_value is None:
+        return None
+    text = str(raw_value).strip()
+    if text == "" or text.lower() in {"auto", "current", "now"}:
+        return None
+    return float(text)
 
 def create_auto_fraunhofer_frame(parent):
     frame = tk.LabelFrame(parent, text="Automatic Fraunhofer (Log Sweep) Settings")
@@ -1529,8 +1543,12 @@ def _fraunhofer_start_clicked(ui: FFUI):
 
     e = ui.frame._entries
     try:
+        target_temp = _parse_target_temp(e["target_temp_K"].get())
+        if target_temp is None:
+            target_temp = _get_T()
         settings = dict(
             coil_start_mA     = float(e["coil_start_mA"].get()),
+            target_temp_K     = float(target_temp),
             coil_max_mA       = float(e["coil_max_mA"].get()),
             log_tier_counts   = _parse_counts(e["log_tier_counts"].get(), DEFAULTS["log_tier_counts"]),
             nplc              = float(e["nplc"].get()),
@@ -1579,7 +1597,7 @@ def _fraunhofer_start_clicked(ui: FFUI):
     _ff_state.stop_event.clear()
     _ff_state.base = base
     _ff_state.settings = settings
-    _ff_state.T0 = _get_T()
+    _ff_state.T0 = float(settings["target_temp_K"])
     _ff_state.rows_pos.clear(); _ff_state.rows_neg.clear()
     _ff_state.iv_points.clear(); _ff_state.iv_search_rows.clear()
     _ff_state.coil_points_A.clear(); _ff_state.icp_points_A.clear(); _ff_state.icn_points_A.clear()
@@ -1591,7 +1609,7 @@ def _fraunhofer_start_clicked(ui: FFUI):
 
     ui.start_btn.config(state=tk.DISABLED)
     ui.stop_btn.config(state=tk.NORMAL)
-    ui.status_lbl.config(text=f"Starting… T0 = {_ff_state.T0:.3f} K")
+    ui.status_lbl.config(text=f"Starting… Ttarget = {_ff_state.T0:.3f} K")
     _ff_state.thread = threading.Thread(target=_worker_run_log, args=(_ff_state,), daemon=True)
     _ff_state.thread.start()
     _poll_queues(_ff_state, ui.status_lbl, ui.bar, ui.ic_line_pos, ui.ic_line_neg, ui.ic_ax,
@@ -1632,8 +1650,12 @@ def _linear_start_clicked(ui: FFUI):
 
     e = ui.frame._entries
     try:
+        target_temp = _parse_target_temp(e["target_temp_K"].get())
+        if target_temp is None:
+            target_temp = _get_T()
         settings = dict(
             coil_start_mA     = float(e["coil_start_mA"].get()),
+            target_temp_K     = float(target_temp),
             coil_max_mA       = float(e["coil_max_mA"].get()),
             coil_step_mA      = float(e["coil_step_mA"].get()),
             nplc              = float(e["nplc"].get()),
@@ -1681,7 +1703,7 @@ def _linear_start_clicked(ui: FFUI):
     _ff_state.stop_event.clear()
     _ff_state.base = base
     _ff_state.settings = settings
-    _ff_state.T0 = _get_T()
+    _ff_state.T0 = float(settings["target_temp_K"])
     _ff_state.rows_pos.clear(); _ff_state.rows_neg.clear()
     _ff_state.iv_points.clear(); _ff_state.iv_search_rows.clear()
     _ff_state.coil_points_A.clear(); _ff_state.icp_points_A.clear(); _ff_state.icn_points_A.clear()
@@ -1693,7 +1715,7 @@ def _linear_start_clicked(ui: FFUI):
 
     ui.start_btn.config(state=tk.DISABLED)
     ui.stop_btn.config(state=tk.NORMAL)
-    ui.status_lbl.config(text=f"Starting (linear)… T0 = {_ff_state.T0:.3f} K")
+    ui.status_lbl.config(text=f"Starting (linear)… Ttarget = {_ff_state.T0:.3f} K")
     _ff_state.thread = threading.Thread(target=_worker_run_linear, args=(_ff_state,), daemon=True)
     _ff_state.thread.start()
     _poll_queues(_ff_state, ui.status_lbl, ui.bar, ui.ic_line_pos, ui.ic_line_neg, ui.ic_ax,
@@ -1716,8 +1738,12 @@ def _rough_start_clicked(ui: FFUI):
 
     e = ui.frame._entries
     try:
+        target_temp = _parse_target_temp(e["target_temp_K"].get())
+        if target_temp is None:
+            target_temp = _get_T()
         settings = dict(
             coil_start_mA     = float(e["coil_start_mA"].get()),
+            target_temp_K     = float(target_temp),
             rough_max_mA      = float(e["rough_max_mA"].get()),
             rough_step_mA     = float(e["rough_step_mA"].get()),
             nplc              = float(e["nplc"].get()),
@@ -1752,7 +1778,7 @@ def _rough_start_clicked(ui: FFUI):
     _ff_state.stop_event.clear()
     _ff_state.base = base
     _ff_state.settings = settings
-    _ff_state.T0 = _get_T()
+    _ff_state.T0 = float(settings["target_temp_K"])
     _ff_state.rows_pos.clear(); _ff_state.rows_neg.clear()
     _ff_state.iv_points.clear(); _ff_state.iv_search_rows.clear()
     _ff_state.coil_points_A.clear(); _ff_state.icp_points_A.clear(); _ff_state.icn_points_A.clear()
@@ -1764,7 +1790,7 @@ def _rough_start_clicked(ui: FFUI):
 
     ui.start_btn.config(state=tk.DISABLED)
     ui.stop_btn.config(state=tk.NORMAL)
-    ui.status_lbl.config(text=f"Starting (rough)… T0 = {_ff_state.T0:.3f} K")
+    ui.status_lbl.config(text=f"Starting (rough)… Ttarget = {_ff_state.T0:.3f} K")
     _ff_state.thread = threading.Thread(target=_worker_run_rough,
                                         args=(_ff_state, ui.ic_line_pos, ui.ic_ax, ui.ic_canvas,
                                               ui.status_lbl, ui.bar),
@@ -1971,7 +1997,7 @@ def _worker_run_log(state: 'FFState'):
         except Exception: pass
         _prep_pulse_smua(k, nplc=s["nplc"], limit_v=0.01)
 
-        start_temp = state.T0
+        target_temp = float(s.get("target_temp_K", state.T0))
         state.progress_q.put(('status', f"Zero-field IV (log mode)… T={_get_T():.3f} K"))
 
         # ----- B=0 characterization -----
@@ -2078,9 +2104,9 @@ def _worker_run_log(state: 'FFState'):
 
             # Temperaturwache (resume/ADR/timeout)
             T = _get_T()
-            if T > start_temp + s["dT_stop"]:
+            if T > target_temp + s["dT_stop"]:
                 t0 = time.time(); adr_sent = False
-                state.progress_q.put(('status', f"PAUSE (log): T={T:.3f} K > {start_temp + s['dT_stop']:.3f} K — waiting"))
+                state.progress_q.put(('status', f"PAUSE (log): T={T:.3f} K > {target_temp + s['dT_stop']:.3f} K — waiting"))
                 while not state.stop_event.is_set():
                     time.sleep(0.5)
                     T = _get_T()
@@ -2099,7 +2125,7 @@ def _worker_run_log(state: 'FFState'):
                         try:
                             state.progress_q.put(('status', f"{'Final ' if final_now else ''}ADR… (event {state.adr_events})"))
                             try:
-                                adr_control.start_adr(setpoint=start_temp, ramp=0.2,
+                                adr_control.start_adr(setpoint=target_temp, ramp=0.2,
                                                       adr_mode=None, operation_mode='cadr',
                                                       auto_regenerate=True, pre_regenerate=True)
                             except Exception as ex:
@@ -2114,12 +2140,12 @@ def _worker_run_log(state: 'FFState'):
                             state.stop_event.set()
                             return
 
-                    if adr_sent and abs(T - start_temp) <= s["adr_settle_K"]:
+                    if adr_sent and abs(T - target_temp) <= s["adr_settle_K"]:
                         state.progress_q.put(('status', "ADR reached setpoint; extra settling…"))
                         time.sleep(max(0.0, s["post_adr_settle_s"]))
                         break
 
-                    if (not adr_sent) and (T <= start_temp + s["dT_resume"]):
+                    if (not adr_sent) and (T <= target_temp + s["dT_resume"]):
                         break
 
                     if elapsed >= s["cooldown_total_s"]:
@@ -2267,7 +2293,7 @@ def _worker_run_linear(state: 'FFState'):
         except Exception: pass
         _prep_pulse_smua(k, nplc=s["nplc"], limit_v=0.01)
 
-        start_temp = state.T0
+        target_temp = float(s.get("target_temp_K", state.T0))
         state.progress_q.put(('status', f"Zero-field IV (linear mode)… T={_get_T():.3f} K"))
 
         # ----- B=0 characterization -----
@@ -2346,8 +2372,9 @@ def _worker_run_linear(state: 'FFState'):
         except Exception as ex:
             state.progress_q.put(('status', f"Warning: failed saving IV_B0: {ex}"))
 
-        prev_ic_pos_uA = max(abs(Ic0p_uA), s["ic_start_uA"])
-        prev_ic_neg_uA = max(abs(Ic0n_uA), s["ic_start_uA"])
+        use_zero_ic_seed = abs(s["coil_start_mA"]) < 1e-6
+        prev_ic_pos_uA = max(abs(Ic0p_uA), s["ic_start_uA"]) if use_zero_ic_seed else None
+        prev_ic_neg_uA = max(abs(Ic0n_uA), s["ic_start_uA"]) if use_zero_ic_seed else None
 
         # ----- Linear coil sweep (dynamisch) -----
         plan_uA = _build_signed_pair_plan_from(
@@ -2369,9 +2396,9 @@ def _worker_run_linear(state: 'FFState'):
 
             # Temperatur-Guard
             T = _get_T()
-            if T > start_temp + s["dT_stop"]:
+            if T > target_temp + s["dT_stop"]:
                 t0 = time.time(); adr_sent = False
-                state.progress_q.put(('status', f"PAUSE (linear): T={T:.3f} K > {start_temp + s['dT_stop']:.3f} K — waiting"))
+                state.progress_q.put(('status', f"PAUSE (linear): T={T:.3f} K > {target_temp + s['dT_stop']:.3f} K — waiting"))
                 while not state.stop_event.is_set():
                     time.sleep(0.5)
                     T = _get_T()
@@ -2390,7 +2417,7 @@ def _worker_run_linear(state: 'FFState'):
                         try:
                             state.progress_q.put(('status', f"{'Final ' if final_now else ''}ADR… (event {state.adr_events})"))
                             try:
-                                adr_control.start_adr(setpoint=start_temp, ramp=0.2,
+                                adr_control.start_adr(setpoint=target_temp, ramp=0.2,
                                                       adr_mode=None, operation_mode='cadr',
                                                       auto_regenerate=True, pre_regenerate=True)
                             except Exception as ex:
@@ -2405,12 +2432,12 @@ def _worker_run_linear(state: 'FFState'):
                             state.stop_event.set()
                             return
 
-                    if adr_sent and abs(T - start_temp) <= s["adr_settle_K"]:
+                    if adr_sent and abs(T - target_temp) <= s["adr_settle_K"]:
                         state.progress_q.put(('status', "ADR reached setpoint; extra settling…"))
                         time.sleep(max(0.0, s["post_adr_settle_s"]))
                         break
 
-                    if (not adr_sent) and (T <= start_temp + s["dT_resume"]):
+                    if (not adr_sent) and (T <= target_temp + s["dT_resume"]):
                         break
 
                     if elapsed >= s["cooldown_total_s"]:
@@ -2566,7 +2593,7 @@ def _worker_run_rough(state: 'FFState', ic_line, ic_ax, ic_canvas, status_lbl, b
         except Exception: pass
         _prep_pulse_smua(k, nplc=s["nplc"], limit_v=0.01)
 
-        start_temp = state.T0
+        target_temp = float(s.get("target_temp_K", state.T0))
         xs_A, icA = [], []
 
         for i, coil_uA in enumerate(coil_setpoints_uA, 1):
@@ -2577,9 +2604,9 @@ def _worker_run_rough(state: 'FFState', ic_line, ic_ax, ic_canvas, status_lbl, b
 
             # Temperatur-Guard
             T = _get_T()
-            if T > start_temp + s["dT_stop"]:
+            if T > target_temp + s["dT_stop"]:
                 t0 = time.time(); adr_sent = False
-                state.progress_q.put(('status', f"PAUSE (rough): T={T:.3f} K > {start_temp + s['dT_stop']:.3f} K — waiting"))
+                state.progress_q.put(('status', f"PAUSE (rough): T={T:.3f} K > {target_temp + s['dT_stop']:.3f} K — waiting"))
                 while not state.stop_event.is_set():
                     time.sleep(0.5)
                     T = _get_T()
@@ -2598,7 +2625,7 @@ def _worker_run_rough(state: 'FFState', ic_line, ic_ax, ic_canvas, status_lbl, b
                         try:
                             state.progress_q.put(('status', f"{'Final ' if final_now else ''}ADR… (event {state.adr_events})"))
                             try:
-                                adr_control.start_adr(setpoint=start_temp, ramp=0.2,
+                                adr_control.start_adr(setpoint=target_temp, ramp=0.2,
                                                       adr_mode=None, operation_mode='cadr',
                                                       auto_regenerate=True, pre_regenerate=True)
                             except Exception as ex:
@@ -2614,12 +2641,12 @@ def _worker_run_rough(state: 'FFState', ic_line, ic_ax, ic_canvas, status_lbl, b
                             state.stop_event.set()
                             return
 
-                    if adr_sent and abs(T - start_temp) <= s["adr_settle_K"]:
+                    if adr_sent and abs(T - target_temp) <= s["adr_settle_K"]:
                         state.progress_q.put(('status', "ADR reached setpoint; extra settling…"))
                         time.sleep(max(0.0, s["post_adr_settle_s"]))
                         break
 
-                    if (not adr_sent) and (T <= start_temp + s["dT_resume"]):
+                    if (not adr_sent) and (T <= target_temp + s["dT_resume"]):
                         break
 
                     if elapsed >= s["cooldown_total_s"]:
