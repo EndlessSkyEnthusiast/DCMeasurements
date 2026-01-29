@@ -610,6 +610,22 @@ def _append_unique_value(seq, seen, v, max_uA):
         seq.append(float(v))
         seen.add(key)
 
+def _use_temperature_control(target_temp):
+    try:
+        return float(target_temp) > 2.9
+    except Exception:
+        return False
+
+def _start_temperature_control(setpoint, ramp=0.2):
+    try:
+        if getattr(temperature_control, "is_active", False):
+            temperature_control.stop()
+            time.sleep(0.5)
+        temperature_control.start((float(setpoint), float(ramp)))
+        return True
+    except Exception:
+        return False
+
 # ---- Temperature/ADR guard (inkl. settle) ----
 def wait_for_temperature_settle(start_temp, s, *, label_prefix="PAUSE"):
     t0 = time.time(); adr_sent = False
@@ -2105,55 +2121,77 @@ def _worker_run_log(state: 'FFState'):
             # Temperaturwache (resume/ADR/timeout)
             T = _get_T()
             if T > target_temp + s["dT_stop"]:
-                t0 = time.time(); adr_sent = False
-                state.progress_q.put(('status', f"PAUSE (log): T={T:.3f} K > {target_temp + s['dT_stop']:.3f} K — waiting"))
-                while not state.stop_event.is_set():
-                    time.sleep(0.5)
-                    T = _get_T()
-                    elapsed = time.time() - t0
-                    eta_adr = max(0, s["adr_trigger_s"] - elapsed)
-                    eta_total = max(0, s["cooldown_total_s"] - elapsed)
-                    txt = (f"PAUSE (log): T={T:.3f} K | ADR in ≥{eta_adr/60:.1f} min | "
-                           f"cooldown ~{eta_total/60:.1f} min | ADR events: {state.adr_events}/"
-                           f"{('∞' if s['adr_max_resets']==0 else s['adr_max_resets'])}")
-                    state.progress_q.put(('status', txt))
-
-                    if (not adr_sent) and (elapsed >= s["adr_trigger_s"]):
-                        state.adr_events += 1
-                        unlimited = (s["adr_max_resets"] == 0)
-                        final_now = (not unlimited) and (state.adr_events >= s["adr_max_resets"])
-                        try:
-                            state.progress_q.put(('status', f"{'Final ' if final_now else ''}ADR… (event {state.adr_events})"))
-                            try:
-                                adr_control.start_adr(setpoint=target_temp, ramp=0.2,
-                                                      adr_mode=None, operation_mode='cadr',
-                                                      auto_regenerate=True, pre_regenerate=True)
-                            except Exception as ex:
-                                state.progress_q.put(('status', f"ADR call failed/absent: {ex}"))
-                            adr_sent = True
-                        except Exception as ex:
-                            state.progress_q.put(('status', f"ADR error: {ex}"))
-                        if final_now:
-                            state.progress_q.put(('status', "Final ADR sent — stopping and saving results…"))
+                t0 = time.time()
+                use_temp_control = _use_temperature_control(target_temp)
+                if use_temp_control:
+                    _start_temperature_control(target_temp, ramp=0.2)
+                    state.progress_q.put(('status', f"PAUSE (log): T={T:.3f} K > {target_temp + s['dT_stop']:.3f} K — TC hold"))
+                    while not state.stop_event.is_set():
+                        time.sleep(0.5)
+                        T = _get_T()
+                        elapsed = time.time() - t0
+                        eta_total = max(0, s["cooldown_total_s"] - elapsed)
+                        txt = (f"PAUSE (log): T={T:.3f} K | TC hold {target_temp:.3f} K | "
+                               f"cooldown ~{eta_total/60:.1f} min")
+                        state.progress_q.put(('status', txt))
+                        if T <= target_temp + s["dT_resume"]:
+                            break
+                        if elapsed >= s["cooldown_total_s"]:
+                            state.progress_q.put(('status', "Cooldown window exceeded — stopping and saving results…"))
                             _save_results(state)
-                            state.progress_q.put(('done', "Stopped after final ADR. Results saved."))
+                            state.progress_q.put(('done', "Stopped after cooldown window. Results saved."))
                             state.stop_event.set()
                             return
+                else:
+                    adr_sent = False
+                    state.progress_q.put(('status', f"PAUSE (log): T={T:.3f} K > {target_temp + s['dT_stop']:.3f} K — waiting"))
+                    while not state.stop_event.is_set():
+                        time.sleep(0.5)
+                        T = _get_T()
+                        elapsed = time.time() - t0
+                        eta_adr = max(0, s["adr_trigger_s"] - elapsed)
+                        eta_total = max(0, s["cooldown_total_s"] - elapsed)
+                        txt = (f"PAUSE (log): T={T:.3f} K | ADR in ≥{eta_adr/60:.1f} min | "
+                               f"cooldown ~{eta_total/60:.1f} min | ADR events: {state.adr_events}/"
+                               f"{('∞' if s['adr_max_resets']==0 else s['adr_max_resets'])}")
+                        state.progress_q.put(('status', txt))
 
-                    if adr_sent and abs(T - target_temp) <= s["adr_settle_K"]:
-                        state.progress_q.put(('status', "ADR reached setpoint; extra settling…"))
-                        time.sleep(max(0.0, s["post_adr_settle_s"]))
-                        break
+                        if (not adr_sent) and (elapsed >= s["adr_trigger_s"]):
+                            state.adr_events += 1
+                            unlimited = (s["adr_max_resets"] == 0)
+                            final_now = (not unlimited) and (state.adr_events >= s["adr_max_resets"])
+                            try:
+                                state.progress_q.put(('status', f"{'Final ' if final_now else ''}ADR… (event {state.adr_events})"))
+                                try:
+                                    adr_control.start_adr(setpoint=target_temp, ramp=0.2,
+                                                          adr_mode=None, operation_mode='cadr',
+                                                          auto_regenerate=True, pre_regenerate=True)
+                                except Exception as ex:
+                                    state.progress_q.put(('status', f"ADR call failed/absent: {ex}"))
+                                adr_sent = True
+                            except Exception as ex:
+                                state.progress_q.put(('status', f"ADR error: {ex}"))
+                            if final_now:
+                                state.progress_q.put(('status', "Final ADR sent — stopping and saving results…"))
+                                _save_results(state)
+                                state.progress_q.put(('done', "Stopped after final ADR. Results saved."))
+                                state.stop_event.set()
+                                return
 
-                    if (not adr_sent) and (T <= target_temp + s["dT_resume"]):
-                        break
+                        if adr_sent and abs(T - target_temp) <= s["adr_settle_K"]:
+                            state.progress_q.put(('status', "ADR reached setpoint; extra settling…"))
+                            time.sleep(max(0.0, s["post_adr_settle_s"]))
+                            break
 
-                    if elapsed >= s["cooldown_total_s"]:
-                        state.progress_q.put(('status', "Cooldown window exceeded — stopping and saving results…"))
-                        _save_results(state)
-                        state.progress_q.put(('done', "Stopped after cooldown window. Results saved."))
-                        state.stop_event.set()
-                        return
+                        if (not adr_sent) and (T <= target_temp + s["dT_resume"]):
+                            break
+
+                        if elapsed >= s["cooldown_total_s"]:
+                            state.progress_q.put(('status', "Cooldown window exceeded — stopping and saving results…"))
+                            _save_results(state)
+                            state.progress_q.put(('done', "Stopped after cooldown window. Results saved."))
+                            state.stop_event.set()
+                            return
 
                 if state.stop_event.is_set():
                     _save_results(state)
@@ -2397,55 +2435,77 @@ def _worker_run_linear(state: 'FFState'):
             # Temperatur-Guard
             T = _get_T()
             if T > target_temp + s["dT_stop"]:
-                t0 = time.time(); adr_sent = False
-                state.progress_q.put(('status', f"PAUSE (linear): T={T:.3f} K > {target_temp + s['dT_stop']:.3f} K — waiting"))
-                while not state.stop_event.is_set():
-                    time.sleep(0.5)
-                    T = _get_T()
-                    elapsed = time.time() - t0
-                    eta_adr = max(0, s["adr_trigger_s"] - elapsed)
-                    eta_total = max(0, s["cooldown_total_s"] - elapsed)
-                    txt = (f"PAUSE (linear): T={T:.3f} K | ADR in ≥{eta_adr/60:.1f} min | "
-                           f"cooldown ~{eta_total/60:.1f} min | ADR events: {state.adr_events}/"
-                           f"{('∞' if s['adr_max_resets']==0 else s['adr_max_resets'])}")
-                    state.progress_q.put(('status', txt))
-
-                    if (not adr_sent) and (elapsed >= s["adr_trigger_s"]):
-                        state.adr_events += 1
-                        unlimited = (s["adr_max_resets"] == 0)
-                        final_now = (not unlimited) and (state.adr_events >= s["adr_max_resets"])
-                        try:
-                            state.progress_q.put(('status', f"{'Final ' if final_now else ''}ADR… (event {state.adr_events})"))
-                            try:
-                                adr_control.start_adr(setpoint=target_temp, ramp=0.2,
-                                                      adr_mode=None, operation_mode='cadr',
-                                                      auto_regenerate=True, pre_regenerate=True)
-                            except Exception as ex:
-                                state.progress_q.put(('status', f"ADR call failed/absent: {ex}"))
-                            adr_sent = True
-                        except Exception as ex:
-                            state.progress_q.put(('status', f"ADR error: {ex}"))
-                        if final_now:
-                            state.progress_q.put(('status', "Final ADR sent — stopping and saving results…"))
+                t0 = time.time()
+                use_temp_control = _use_temperature_control(target_temp)
+                if use_temp_control:
+                    _start_temperature_control(target_temp, ramp=0.2)
+                    state.progress_q.put(('status', f"PAUSE (linear): T={T:.3f} K > {target_temp + s['dT_stop']:.3f} K — TC hold"))
+                    while not state.stop_event.is_set():
+                        time.sleep(0.5)
+                        T = _get_T()
+                        elapsed = time.time() - t0
+                        eta_total = max(0, s["cooldown_total_s"] - elapsed)
+                        txt = (f"PAUSE (linear): T={T:.3f} K | TC hold {target_temp:.3f} K | "
+                               f"cooldown ~{eta_total/60:.1f} min")
+                        state.progress_q.put(('status', txt))
+                        if T <= target_temp + s["dT_resume"]:
+                            break
+                        if elapsed >= s["cooldown_total_s"]:
+                            state.progress_q.put(('status', "Cooldown window exceeded — stopping and saving results…"))
                             _save_results(state)
-                            state.progress_q.put(('done', "Stopped after final ADR. Results saved."))
+                            state.progress_q.put(('done', "Stopped after cooldown window. Results saved."))
                             state.stop_event.set()
                             return
+                else:
+                    adr_sent = False
+                    state.progress_q.put(('status', f"PAUSE (linear): T={T:.3f} K > {target_temp + s['dT_stop']:.3f} K — waiting"))
+                    while not state.stop_event.is_set():
+                        time.sleep(0.5)
+                        T = _get_T()
+                        elapsed = time.time() - t0
+                        eta_adr = max(0, s["adr_trigger_s"] - elapsed)
+                        eta_total = max(0, s["cooldown_total_s"] - elapsed)
+                        txt = (f"PAUSE (linear): T={T:.3f} K | ADR in ≥{eta_adr/60:.1f} min | "
+                               f"cooldown ~{eta_total/60:.1f} min | ADR events: {state.adr_events}/"
+                               f"{('∞' if s['adr_max_resets']==0 else s['adr_max_resets'])}")
+                        state.progress_q.put(('status', txt))
 
-                    if adr_sent and abs(T - target_temp) <= s["adr_settle_K"]:
-                        state.progress_q.put(('status', "ADR reached setpoint; extra settling…"))
-                        time.sleep(max(0.0, s["post_adr_settle_s"]))
-                        break
+                        if (not adr_sent) and (elapsed >= s["adr_trigger_s"]):
+                            state.adr_events += 1
+                            unlimited = (s["adr_max_resets"] == 0)
+                            final_now = (not unlimited) and (state.adr_events >= s["adr_max_resets"])
+                            try:
+                                state.progress_q.put(('status', f"{'Final ' if final_now else ''}ADR… (event {state.adr_events})"))
+                                try:
+                                    adr_control.start_adr(setpoint=target_temp, ramp=0.2,
+                                                          adr_mode=None, operation_mode='cadr',
+                                                          auto_regenerate=True, pre_regenerate=True)
+                                except Exception as ex:
+                                    state.progress_q.put(('status', f"ADR call failed/absent: {ex}"))
+                                adr_sent = True
+                            except Exception as ex:
+                                state.progress_q.put(('status', f"ADR error: {ex}"))
+                            if final_now:
+                                state.progress_q.put(('status', "Final ADR sent — stopping and saving results…"))
+                                _save_results(state)
+                                state.progress_q.put(('done', "Stopped after final ADR. Results saved."))
+                                state.stop_event.set()
+                                return
 
-                    if (not adr_sent) and (T <= target_temp + s["dT_resume"]):
-                        break
+                        if adr_sent and abs(T - target_temp) <= s["adr_settle_K"]:
+                            state.progress_q.put(('status', "ADR reached setpoint; extra settling…"))
+                            time.sleep(max(0.0, s["post_adr_settle_s"]))
+                            break
 
-                    if elapsed >= s["cooldown_total_s"]:
-                        state.progress_q.put(('status', "Cooldown window exceeded — stopping and saving results…"))
-                        _save_results(state)
-                        state.progress_q.put(('done', "Stopped after cooldown window. Results saved."))
-                        state.stop_event.set()
-                        return
+                        if (not adr_sent) and (T <= target_temp + s["dT_resume"]):
+                            break
+
+                        if elapsed >= s["cooldown_total_s"]:
+                            state.progress_q.put(('status', "Cooldown window exceeded — stopping and saving results…"))
+                            _save_results(state)
+                            state.progress_q.put(('done', "Stopped after cooldown window. Results saved."))
+                            state.stop_event.set()
+                            return
 
                 if state.stop_event.is_set():
                     _save_results(state)
@@ -2605,56 +2665,78 @@ def _worker_run_rough(state: 'FFState', ic_line, ic_ax, ic_canvas, status_lbl, b
             # Temperatur-Guard
             T = _get_T()
             if T > target_temp + s["dT_stop"]:
-                t0 = time.time(); adr_sent = False
-                state.progress_q.put(('status', f"PAUSE (rough): T={T:.3f} K > {target_temp + s['dT_stop']:.3f} K — waiting"))
-                while not state.stop_event.is_set():
-                    time.sleep(0.5)
-                    T = _get_T()
-                    elapsed = time.time() - t0
-                    eta_adr = max(0, s["adr_trigger_s"] - elapsed)
-                    eta_total = max(0, s["cooldown_total_s"] - elapsed)
-                    txt = (f"PAUSE (rough): T={T:.3f} K | ADR in ≥{eta_adr/60:.1f} min | "
-                           f"cooldown ~{eta_total/60:.1f} min | ADR events: {state.adr_events}/"
-                           f"{('∞' if s['adr_max_resets']==0 else s['adr_max_resets'])}")
-                    state.progress_q.put(('status', txt))
-
-                    if (not adr_sent) and (elapsed >= s["adr_trigger_s"]):
-                        state.adr_events += 1
-                        unlimited = (s["adr_max_resets"] == 0)
-                        final_now = (not unlimited) and (state.adr_events >= s["adr_max_resets"])
-                        try:
-                            state.progress_q.put(('status', f"{'Final ' if final_now else ''}ADR… (event {state.adr_events})"))
-                            try:
-                                adr_control.start_adr(setpoint=target_temp, ramp=0.2,
-                                                      adr_mode=None, operation_mode='cadr',
-                                                      auto_regenerate=True, pre_regenerate=True)
-                            except Exception as ex:
-                                state.progress_q.put(('status', f"ADR call failed/absent: {ex}"))
-                            adr_sent = True
-                        except Exception as ex:
-                            state.progress_q.put(('status', f"ADR error: {ex}"))
-
-                        if final_now:
-                            state.progress_q.put(('status', "Final ADR sent — stopping and saving results…"))
+                t0 = time.time()
+                use_temp_control = _use_temperature_control(target_temp)
+                if use_temp_control:
+                    _start_temperature_control(target_temp, ramp=0.2)
+                    state.progress_q.put(('status', f"PAUSE (rough): T={T:.3f} K > {target_temp + s['dT_stop']:.3f} K — TC hold"))
+                    while not state.stop_event.is_set():
+                        time.sleep(0.5)
+                        T = _get_T()
+                        elapsed = time.time() - t0
+                        eta_total = max(0, s["cooldown_total_s"] - elapsed)
+                        txt = (f"PAUSE (rough): T={T:.3f} K | TC hold {target_temp:.3f} K | "
+                               f"cooldown ~{eta_total/60:.1f} min")
+                        state.progress_q.put(('status', txt))
+                        if T <= target_temp + s["dT_resume"]:
+                            break
+                        if elapsed >= s["cooldown_total_s"]:
+                            state.progress_q.put(('status', "Cooldown window exceeded — stopping and saving results…"))
                             _save_rough_arrays(state, xs_A, icA, suffix="_PARTIAL")
-                            state.progress_q.put(('done', "Stopped after final ADR. Results saved."))
+                            state.progress_q.put(('done', "Stopped after cooldown window. Results saved."))
                             state.stop_event.set()
                             return
+                else:
+                    adr_sent = False
+                    state.progress_q.put(('status', f"PAUSE (rough): T={T:.3f} K > {target_temp + s['dT_stop']:.3f} K — waiting"))
+                    while not state.stop_event.is_set():
+                        time.sleep(0.5)
+                        T = _get_T()
+                        elapsed = time.time() - t0
+                        eta_adr = max(0, s["adr_trigger_s"] - elapsed)
+                        eta_total = max(0, s["cooldown_total_s"] - elapsed)
+                        txt = (f"PAUSE (rough): T={T:.3f} K | ADR in ≥{eta_adr/60:.1f} min | "
+                               f"cooldown ~{eta_total/60:.1f} min | ADR events: {state.adr_events}/"
+                               f"{('∞' if s['adr_max_resets']==0 else s['adr_max_resets'])}")
+                        state.progress_q.put(('status', txt))
 
-                    if adr_sent and abs(T - target_temp) <= s["adr_settle_K"]:
-                        state.progress_q.put(('status', "ADR reached setpoint; extra settling…"))
-                        time.sleep(max(0.0, s["post_adr_settle_s"]))
-                        break
+                        if (not adr_sent) and (elapsed >= s["adr_trigger_s"]):
+                            state.adr_events += 1
+                            unlimited = (s["adr_max_resets"] == 0)
+                            final_now = (not unlimited) and (state.adr_events >= s["adr_max_resets"])
+                            try:
+                                state.progress_q.put(('status', f"{'Final ' if final_now else ''}ADR… (event {state.adr_events})"))
+                                try:
+                                    adr_control.start_adr(setpoint=target_temp, ramp=0.2,
+                                                          adr_mode=None, operation_mode='cadr',
+                                                          auto_regenerate=True, pre_regenerate=True)
+                                except Exception as ex:
+                                    state.progress_q.put(('status', f"ADR call failed/absent: {ex}"))
+                                adr_sent = True
+                            except Exception as ex:
+                                state.progress_q.put(('status', f"ADR error: {ex}"))
 
-                    if (not adr_sent) and (T <= target_temp + s["dT_resume"]):
-                        break
+                            if final_now:
+                                state.progress_q.put(('status', "Final ADR sent — stopping and saving results…"))
+                                _save_rough_arrays(state, xs_A, icA, suffix="_PARTIAL")
+                                state.progress_q.put(('done', "Stopped after final ADR. Results saved."))
+                                state.stop_event.set()
+                                return
 
-                    if elapsed >= s["cooldown_total_s"]:
-                        state.progress_q.put(('status', "Cooldown window exceeded — stopping and saving results…"))
-                        _save_rough_arrays(state, xs_A, icA, suffix="_PARTIAL")
-                        state.progress_q.put(('done', "Stopped after cooldown window. Results saved."))
-                        state.stop_event.set()
-                        return
+                        if adr_sent and abs(T - target_temp) <= s["adr_settle_K"]:
+                            state.progress_q.put(('status', "ADR reached setpoint; extra settling…"))
+                            time.sleep(max(0.0, s["post_adr_settle_s"]))
+                            break
+
+                        if (not adr_sent) and (T <= target_temp + s["dT_resume"]):
+                            break
+
+                        if elapsed >= s["cooldown_total_s"]:
+                            state.progress_q.put(('status', "Cooldown window exceeded — stopping and saving results…"))
+                            _save_rough_arrays(state, xs_A, icA, suffix="_PARTIAL")
+                            state.progress_q.put(('done', "Stopped after cooldown window. Results saved."))
+                            state.stop_event.set()
+                            return
 
                 if state.stop_event.is_set():
                     _save_rough_arrays(state, xs_A, icA, suffix="_PARTIAL")
