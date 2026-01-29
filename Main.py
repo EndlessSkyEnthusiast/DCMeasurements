@@ -298,6 +298,10 @@ class FFState:
         self.rows_pos = []               # [timestamp, T, Icoil[A], Ic_pos[A], limit]
         self.rows_neg = []               # [timestamp, T, Icoil[A], Ic_neg[A], limit]
         self.iv_points = []              # live IV (B=0)
+        self.iv_first_points = []        # first IV curve (B=0)
+        self.iv_latest_points = []       # latest IV curve (B=0)
+        self.iv_current_points = None    # active IV curve collector
+        self.iv_curve_index = 0
         self.iv_search_rows = []         # ALL pulses: [timestamp,T[K],Icoil[A],branch,I_junc[A],V[V]]
         self.coil_points_A = []          # x-values for Ic plot
         self.icp_points_A = []           # y+ scatter
@@ -525,14 +529,21 @@ def _set_measure_speeds(nplc):
     try: k2.smua.measure.nplc = float(nplc)
     except Exception: pass
 
-def _make_plot_window(title, xlab, ylab, with_two_series=False):
+def _make_plot_window(title, xlab, ylab, with_two_series=False,
+                      label1=None, label2=None, color1=None, color2=None):
     win = tk.Toplevel(root); win.title(title)
     fig = Figure(figsize=(6, 4), dpi=100); ax = fig.add_subplot(111)
     ax.set_xlabel(xlab); ax.set_ylabel(ylab); ax.set_title(title)
-    line1, = ax.plot([], [], linestyle='None', marker='o', markersize=3, label=("Ic+" if with_two_series else "data"))
+    if label1 is None:
+        label1 = "Ic+" if with_two_series else "data"
+    line1, = ax.plot([], [], linestyle='None', marker='o', markersize=3,
+                     label=label1, color=color1)
     line2 = None
     if with_two_series:
-        line2, = ax.plot([], [], linestyle='None', marker='o', markersize=3, label="Ic−")
+        if label2 is None:
+            label2 = "Ic−"
+        line2, = ax.plot([], [], linestyle='None', marker='o', markersize=3,
+                         label=label2, color=color2)
         ax.legend(loc="best")
     else:
         try: ax.legend().remove()
@@ -755,6 +766,14 @@ def _junction_pulse_measure_v(I_uA, pulse_width_s, pulse_settle_s, cooldown_s):
     _drain_errors_periodic(_ERR_DRAIN_EVERY)
 
     return v
+
+
+def _junction_pulse_measure_v_guarded(I_uA, pulse_width_s, pulse_settle_s, cooldown_s, temp_guard=None):
+    if temp_guard:
+        ok = temp_guard()
+        if not ok:
+            return None
+    return _junction_pulse_measure_v(I_uA, pulse_width_s, pulse_settle_s, cooldown_s)
 # --- Helper Patch: add missing helpers if not already defined ---
 
 import numpy as np, datetime, os
@@ -1003,7 +1022,7 @@ def _find_ic_uA_adaptive(
     v_thresh, start_uA, growth, max_uA, refine_bits,
     pulse_width_s, pulse_settle_s, cooldown_s,
     *, sign=+1, collect_iv=False, stop_event=None,
-    switch_confirm=3, min_ic_uA=None
+    switch_confirm=3, min_ic_uA=None, temp_guard=None
 ):
     iv = []
     start_uA = float(max(0.0, start_uA))
@@ -1013,7 +1032,8 @@ def _find_ic_uA_adaptive(
     while current <= max_uA:
         if stop_event and stop_event.is_set(): return (sign * last_ok, True, iv)
         I_try = sign * current
-        v = _junction_pulse_measure_v(I_try, pulse_width_s, pulse_settle_s, cooldown_s)
+        v = _junction_pulse_measure_v_guarded(I_try, pulse_width_s, pulse_settle_s, cooldown_s, temp_guard)
+        if v is None: return (sign * last_ok, True, iv)
         if collect_iv: iv.append((I_try, v))
 
         confirm_extra      = int(DEFAULTS.get("confirm_extra_pulses", 2))
@@ -1024,7 +1044,7 @@ def _find_ic_uA_adaptive(
             ok = _confirm_switch_same_I(sign, current,
                                         pulse_width_s, pulse_settle_s, cooldown_s,
                                         v_thresh, confirm_rel, confirm_extra, confirm_accept_min,
-                                        collect_iv=collect_iv, iv_sink=iv)
+                                        collect_iv=collect_iv, iv_sink=iv, temp_guard=temp_guard)
             if ok:
                 consec_over += 1
                 if consec_over >= int(switch_confirm):
@@ -1046,7 +1066,8 @@ def _find_ic_uA_adaptive(
     for _ in range(int(refine_bits)):
         if stop_event and stop_event.is_set(): return (sign * (0.5*(low+high)), True, iv)
         mid = 0.5 * (low + high)
-        v = _junction_pulse_measure_v(sign * mid, pulse_width_s, pulse_settle_s, cooldown_s)
+        v = _junction_pulse_measure_v_guarded(sign * mid, pulse_width_s, pulse_settle_s, cooldown_s, temp_guard)
+        if v is None: return (sign * (0.5*(low+high)), True, iv)
         if collect_iv: iv.append((sign * mid, v))
         if abs(v) >= v_thresh: high = mid
         else: low = mid
@@ -1055,22 +1076,26 @@ def _find_ic_uA_adaptive(
 
 def _confirm_switch_same_I(sign, IuA, pulse_width_s, pulse_settle_s, cooldown_s,
                            v_thresh, rel_thresh, extra_pulses, accept_min,
-                           *, collect_iv=False, iv_sink=None):
+                           *, collect_iv=False, iv_sink=None, temp_guard=None):
     """Mehrfachmessung am selben I: akzepte nur, wenn genügend Wiederholungen ≥ rel*Vthresh."""
     thr = float(v_thresh) * float(rel_thresh)
     hits = 0
     for _ in range(int(extra_pulses)):
-        v2 = _junction_pulse_measure_v(sign * float(IuA), pulse_width_s, pulse_settle_s, cooldown_s)
+        v2 = _junction_pulse_measure_v_guarded(sign * float(IuA), pulse_width_s, pulse_settle_s, cooldown_s, temp_guard)
+        if v2 is None:
+            return False
         if collect_iv and iv_sink is not None:
             iv_sink.append((sign * float(IuA), v2))
         if np.isfinite(v2) and abs(v2) >= thr:
             hits += 1
     return (hits >= int(accept_min))
 
-def _guided_pulse(sign, IuA, pulse_width_s, pulse_settle_s, cooldown_s, collect_iv, iv, stop_event):
+def _guided_pulse(sign, IuA, pulse_width_s, pulse_settle_s, cooldown_s, collect_iv, iv, stop_event, temp_guard=None):
     if stop_event and stop_event.is_set():
         return None
-    v = _junction_pulse_measure_v(sign * IuA, pulse_width_s, pulse_settle_s, cooldown_s)
+    v = _junction_pulse_measure_v_guarded(sign * IuA, pulse_width_s, pulse_settle_s, cooldown_s, temp_guard)
+    if v is None:
+        return None
     if collect_iv:
         iv.append((sign * IuA, v))
     return v
@@ -1081,14 +1106,14 @@ def _find_ic_uA_guided(
     pulse_width_s, pulse_settle_s, cooldown_s,
     *, sign=+1, collect_iv=False, stop_event=None,
     prev_ic_uA=None, lower_frac=0.10, step_rel=0.05, min_step_uA=0.05, window_frac=0.25,
-    switch_confirm=3, min_ic_uA=None
+    switch_confirm=3, min_ic_uA=None, temp_guard=None
 ):
     if not prev_ic_uA or prev_ic_uA <= 0:
         return _find_ic_uA_adaptive(
             v_thresh, max(start_uA, (min_ic_uA or 0.0)), growth, max_uA, refine_bits,
             pulse_width_s, pulse_settle_s, cooldown_s,
             sign=sign, collect_iv=collect_iv, stop_event=stop_event,
-            switch_confirm=switch_confirm, min_ic_uA=min_ic_uA
+            switch_confirm=switch_confirm, min_ic_uA=min_ic_uA, temp_guard=temp_guard
         )
 
     iv = []
@@ -1099,13 +1124,13 @@ def _find_ic_uA_guided(
     hi_cap    = min(max_uA,  prev_mag * (1.0 + float(window_frac)))
     step_uA   = max(min_step_uA, prev_mag * float(step_rel))
 
-    v0 = _guided_pulse(sign, low_start, pulse_width_s, pulse_settle_s, cooldown_s, collect_iv, iv, stop_event)
+    v0 = _guided_pulse(sign, low_start, pulse_width_s, pulse_settle_s, cooldown_s, collect_iv, iv, stop_event, temp_guard)
     if v0 is None: return (sign * low_start, True, iv)
 
     if abs(v0) >= v_thresh:
         last_bad = low_start; cur = max(start_uA, low_start * (1.0 - step_rel)); last_ok = None
         for _ in range(200):
-            v = _guided_pulse(sign, cur, pulse_width_s, pulse_settle_s, cooldown_s, collect_iv, iv, stop_event)
+            v = _guided_pulse(sign, cur, pulse_width_s, pulse_settle_s, cooldown_s, collect_iv, iv, stop_event, temp_guard)
             if v is None: return (sign * (last_ok if last_ok else cur), True, iv)
             if abs(v) < v_thresh: last_ok = cur; break
             last_bad = cur; cur = max(start_uA, cur * (1.0 - step_rel))
@@ -1115,7 +1140,7 @@ def _find_ic_uA_guided(
         last_ok = low_start; last_bad = None; cur = low_start + step_uA; consec_over = 0
         for _ in range(2000):
             if cur > hi_cap: break
-            v = _guided_pulse(sign, cur, pulse_width_s, pulse_settle_s, cooldown_s, collect_iv, iv, stop_event)
+            v = _guided_pulse(sign, cur, pulse_width_s, pulse_settle_s, cooldown_s, collect_iv, iv, stop_event, temp_guard)
             if v is None: return (sign * last_ok, True, iv)
 
             confirm_extra      = int(DEFAULTS.get("confirm_extra_pulses", 2))
@@ -1126,7 +1151,7 @@ def _find_ic_uA_guided(
                 ok = _confirm_switch_same_I(sign, cur,
                                             pulse_width_s, pulse_settle_s, cooldown_s,
                                             v_thresh, confirm_rel, confirm_extra, confirm_accept_min,
-                                            collect_iv=collect_iv, iv_sink=iv)
+                                            collect_iv=collect_iv, iv_sink=iv, temp_guard=temp_guard)
                 if ok:
                     consec_over += 1
                     if consec_over >= int(switch_confirm):
@@ -1144,7 +1169,7 @@ def _find_ic_uA_guided(
         # Expand, falls noch kein last_bad
         expand_rounds = 0; cur_hi = max(low_start + step_uA, last_ok + step_uA)
         while last_bad is None and cur_hi <= max_uA and expand_rounds < 10:
-            v = _guided_pulse(sign, cur_hi, pulse_width_s, pulse_settle_s, cooldown_s, collect_iv, iv, stop_event)
+            v = _guided_pulse(sign, cur_hi, pulse_width_s, pulse_settle_s, cooldown_s, collect_iv, iv, stop_event, temp_guard)
             if v is None: return (sign * last_ok, True, iv)
             if np.isfinite(v) and abs(v) >= v_thresh:
                 confirm_extra      = int(DEFAULTS.get("confirm_extra_pulses", 2))
@@ -1153,7 +1178,7 @@ def _find_ic_uA_guided(
                 ok = _confirm_switch_same_I(sign, cur_hi,
                                             pulse_width_s, pulse_settle_s, cooldown_s,
                                             v_thresh, confirm_rel, confirm_extra, confirm_accept_min,
-                                            collect_iv=collect_iv, iv_sink=iv)
+                                            collect_iv=collect_iv, iv_sink=iv, temp_guard=temp_guard)
                 if ok:
                     last_bad = cur_hi
                     break
@@ -1172,7 +1197,7 @@ def _find_ic_uA_guided(
     for _ in range(int(refine_bits)):
         if stop_event and stop_event.is_set(): return (sign * (0.5*(low+high)), True, iv)
         mid = 0.5 * (low + high)
-        v = _guided_pulse(sign, mid, pulse_width_s, pulse_settle_s, cooldown_s, collect_iv, iv, stop_event)
+        v = _guided_pulse(sign, mid, pulse_width_s, pulse_settle_s, cooldown_s, collect_iv, iv, stop_event, temp_guard)
         if v is None: return (sign * (0.5*(low+high)), True, iv)
         if abs(v) >= v_thresh: high = mid
         else: low = mid
@@ -1182,7 +1207,7 @@ def _find_ic_uA_guided(
 # --- Band/IV-Refinements ---
 def _refine_band_below_ic(sign, ic_uA, frac_low, npts, top_margin,
                           start_uA, max_uA, pulse_width_s, pulse_settle_s, cooldown_s,
-                          collect_iv, stop_event):
+                          collect_iv, stop_event, temp_guard=None):
     """Refine knapp unter Ic; garantiert mindestens einen Punkt < ~Vthresh."""
     if ic_uA is None or ic_uA <= 0 or npts <= 1:
         return []
@@ -1197,7 +1222,9 @@ def _refine_band_below_ic(sign, ic_uA, frac_low, npts, top_margin,
     for I in currents:
         if stop_event.is_set():
             break
-        v = _junction_pulse_measure_v(I, pulse_width_s, pulse_settle_s, cooldown_s)
+        v = _junction_pulse_measure_v_guarded(I, pulse_width_s, pulse_settle_s, cooldown_s, temp_guard)
+        if v is None:
+            break
         if collect_iv:
             iv_list.append((I, v))
 
@@ -1208,7 +1235,9 @@ def _refine_band_below_ic(sign, ic_uA, frac_low, npts, top_margin,
         if not (np.isfinite(Vmin) and abs(Vmin) < 0.9 * vthresh):
             extra_I = Imin * 0.8
             if abs(extra_I) >= start_uA:
-                v_extra = _junction_pulse_measure_v(extra_I, pulse_width_s, pulse_settle_s, cooldown_s)
+                v_extra = _junction_pulse_measure_v_guarded(extra_I, pulse_width_s, pulse_settle_s, cooldown_s, temp_guard)
+                if v_extra is None:
+                    return iv_list
                 iv_list.insert(0, (extra_I, v_extra))
 
     return iv_list
@@ -1216,7 +1245,7 @@ def _refine_band_below_ic(sign, ic_uA, frac_low, npts, top_margin,
 
 def _iv0_refine_around_ic(sign, Ic_uA, pts, above_frac, window_frac,
                           start_uA, max_uA, pulse_width_s, pulse_settle_s, cooldown_s,
-                          *, collect_iv=True, stop_event=None):
+                          *, collect_iv=True, stop_event=None, temp_guard=None):
     if Ic_uA is None or Ic_uA <= 0: return []
     Ic = float(Ic_uA)
     lo = max(start_uA, Ic * (1.0 - float(window_frac)))
@@ -1229,7 +1258,9 @@ def _iv0_refine_around_ic(sign, Ic_uA, pts, above_frac, window_frac,
     grid  = np.concatenate([below, above]); out = []
     for IuA in grid:
         if stop_event and stop_event.is_set(): break
-        v = _junction_pulse_measure_v(sign * IuA, pulse_width_s, pulse_settle_s, cooldown_s)
+        v = _junction_pulse_measure_v_guarded(sign * IuA, pulse_width_s, pulse_settle_s, cooldown_s, temp_guard)
+        if v is None:
+            break
         if collect_iv: out.append((sign * IuA, v))
     return out
 
@@ -1476,7 +1507,7 @@ def _start_stop_buttons(parent):
     return start_btn, stop_btn
 
 def _poll_queues(state, status_lbl, bar, ic_line_pos, ic_line_neg, ic_ax, ic_canvas,
-                 iv_line=None, iv_ax=None, iv_canvas=None):
+                 iv_line=None, iv_ax=None, iv_canvas=None, iv_line_latest=None):
     try:
         while True:
             msg = state.progress_q.get_nowait()
@@ -1505,13 +1536,40 @@ def _poll_queues(state, status_lbl, bar, ic_line_pos, ic_line_neg, ic_ax, ic_can
                 ic_ax.relim(); ic_ax.autoscale_view()
                 ic_canvas.draw_idle()
 
+            elif tag == 'iv_start' and iv_line is not None and iv_ax is not None and iv_canvas is not None:
+                state.iv_curve_index += 1
+                state.iv_current_points = []
+                if state.iv_curve_index == 1:
+                    state.iv_first_points = state.iv_current_points
+                    state.iv_latest_points = state.iv_current_points
+                else:
+                    state.iv_latest_points = state.iv_current_points
+
             elif tag == 'iv' and iv_line is not None and iv_ax is not None and iv_canvas is not None:
                 I, V = msg[1], msg[2]
-                state.iv_points.append((I, V))
-                if len(state.iv_points) >= 2:
-                    xs = [p[0] for p in state.iv_points]
-                    ys = [p[1] for p in state.iv_points]
-                    iv_line.set_data(xs, ys)
+                if iv_line_latest is None:
+                    state.iv_points.append((I, V))
+                    if len(state.iv_points) >= 2:
+                        xs = [p[0] for p in state.iv_points]
+                        ys = [p[1] for p in state.iv_points]
+                        iv_line.set_data(xs, ys)
+                        iv_ax.relim(); iv_ax.autoscale_view()
+                        iv_canvas.draw_idle()
+                else:
+                    if state.iv_current_points is None:
+                        state.iv_curve_index += 1
+                        state.iv_current_points = []
+                        state.iv_first_points = state.iv_current_points
+                        state.iv_latest_points = state.iv_current_points
+                    state.iv_current_points.append((I, V))
+                    if len(state.iv_first_points) >= 2:
+                        xs = [p[0] for p in state.iv_first_points]
+                        ys = [p[1] for p in state.iv_first_points]
+                        iv_line.set_data(xs, ys)
+                    if len(state.iv_latest_points) >= 2 and iv_line_latest is not None:
+                        xs = [p[0] for p in state.iv_latest_points]
+                        ys = [p[1] for p in state.iv_latest_points]
+                        iv_line_latest.set_data(xs, ys)
                     iv_ax.relim(); iv_ax.autoscale_view()
                     iv_canvas.draw_idle()
 
@@ -1531,7 +1589,7 @@ def _poll_queues(state, status_lbl, bar, ic_line_pos, ic_line_neg, ic_ax, ic_can
     # Solange der Thread läuft, weiter pollen
     if state and state.thread and state.thread.is_alive():
         root.after(100, lambda: _poll_queues(state, status_lbl, bar, ic_line_pos, ic_line_neg,
-                                             ic_ax, ic_canvas, iv_line, iv_ax, iv_canvas))
+                                             ic_ax, ic_canvas, iv_line, iv_ax, iv_canvas, iv_line_latest))
 
 @dataclass
 class FFUI:
@@ -1545,6 +1603,7 @@ class FFUI:
     ic_ax: object
     ic_canvas: object
     iv_line: object
+    iv_line_latest: object = None
     iv_ax: object
     iv_canvas: object
     step_entry: object = None
@@ -1616,6 +1675,10 @@ def _fraunhofer_start_clicked(ui: FFUI):
     _ff_state.T0 = float(settings["target_temp_K"])
     _ff_state.rows_pos.clear(); _ff_state.rows_neg.clear()
     _ff_state.iv_points.clear(); _ff_state.iv_search_rows.clear()
+    _ff_state.iv_first_points.clear(); _ff_state.iv_latest_points.clear()
+    _ff_state.iv_current_points = None; _ff_state.iv_curve_index = 0
+    _ff_state.iv_first_points.clear(); _ff_state.iv_latest_points.clear()
+    _ff_state.iv_current_points = None; _ff_state.iv_curve_index = 0
     _ff_state.coil_points_A.clear(); _ff_state.icp_points_A.clear(); _ff_state.icn_points_A.clear()
     _ff_state.adr_events = 0
 
@@ -1629,7 +1692,7 @@ def _fraunhofer_start_clicked(ui: FFUI):
     _ff_state.thread = threading.Thread(target=_worker_run_log, args=(_ff_state,), daemon=True)
     _ff_state.thread.start()
     _poll_queues(_ff_state, ui.status_lbl, ui.bar, ui.ic_line_pos, ui.ic_line_neg, ui.ic_ax,
-                 ui.ic_canvas, ui.iv_line, ui.iv_ax, ui.iv_canvas)
+                 ui.ic_canvas, ui.iv_line, ui.iv_ax, ui.iv_canvas, ui.iv_line_latest)
 
 def _fraunhofer_stop_clicked(ui: FFUI):
     if _ff_state and _ff_state.thread and _ff_state.thread.is_alive():
@@ -1722,6 +1785,8 @@ def _linear_start_clicked(ui: FFUI):
     _ff_state.T0 = float(settings["target_temp_K"])
     _ff_state.rows_pos.clear(); _ff_state.rows_neg.clear()
     _ff_state.iv_points.clear(); _ff_state.iv_search_rows.clear()
+    _ff_state.iv_first_points.clear(); _ff_state.iv_latest_points.clear()
+    _ff_state.iv_current_points = None; _ff_state.iv_curve_index = 0
     _ff_state.coil_points_A.clear(); _ff_state.icp_points_A.clear(); _ff_state.icn_points_A.clear()
     _ff_state.adr_events = 0
 
@@ -1735,7 +1800,7 @@ def _linear_start_clicked(ui: FFUI):
     _ff_state.thread = threading.Thread(target=_worker_run_linear, args=(_ff_state,), daemon=True)
     _ff_state.thread.start()
     _poll_queues(_ff_state, ui.status_lbl, ui.bar, ui.ic_line_pos, ui.ic_line_neg, ui.ic_ax,
-                 ui.ic_canvas, ui.iv_line, ui.iv_ax, ui.iv_canvas)
+                 ui.ic_canvas, ui.iv_line, ui.iv_ax, ui.iv_canvas, ui.iv_line_latest)
 
 def _linear_stop_clicked(ui: FFUI):
     if _ff_state and _ff_state.thread and _ff_state.thread.is_alive():
@@ -1904,8 +1969,9 @@ def MagneticMeasurementLinear():
     ic_win, ic_fig, ic_ax, ic_line_pos, ic_line_neg, ic_canvas = _make_plot_window(
         title="Ic vs I_coil (linear, live)", xlab="I_coil (A)", ylab="Ic (A)", with_two_series=True
     )
-    iv_win, iv_fig, iv_ax, iv_line, _, iv_canvas = _make_plot_window(
-        title="Zero-field IV (B = 0)", xlab="I_junc (A)", ylab="V (V)", with_two_series=False
+    iv_win, iv_fig, iv_ax, iv_line, iv_line_latest, iv_canvas = _make_plot_window(
+        title="Zero-field IV (B = 0)", xlab="I_junc (A)", ylab="V (V)", with_two_series=True,
+        label1="First curve", label2="Latest curve", color1="tab:blue", color2="tab:red"
     )
 
     global _ff_state, _pulse_counter, _ERR_DRAIN_EVERY
@@ -1924,6 +1990,7 @@ def MagneticMeasurementLinear():
         iv_line=iv_line,
         iv_ax=iv_ax,
         iv_canvas=iv_canvas,
+        iv_line_latest=iv_line_latest,
         step_entry=step_entry,
         jump_entry=jump_entry,
     )
@@ -2209,7 +2276,7 @@ def _worker_run_log(state: 'FFState'):
                 pulse_width_s=s["pulse_width_s"], pulse_settle_s=s["pulse_settle_s"], cooldown_s=s["cooldown_s"],
                 sign=+1, collect_iv=True, stop_event=state.stop_event, prev_ic_uA=prev_ic_pos_uA,
                 lower_frac=s["guided_lower_frac"], step_rel=s["guided_step_rel"], min_step_uA=s["guided_min_step_uA"],
-                window_frac=s["guided_window_frac"], switch_confirm=s["switch_confirm"],
+                window_frac=s["guided_window_frac"], switch_confirm=s["switch_confirm"], temp_guard=_linear_temp_guard,
             )
 
             ivp_band = []
@@ -2218,7 +2285,7 @@ def _worker_run_log(state: 'FFState'):
                                                  s["band_refine_frac_low"], s["band_refine_pts"], s["band_refine_top_margin"],
                                                  s["ic_start_uA"], s["ic_max_uA"],
                                                  s["pulse_width_s"], s["pulse_settle_s"], s["cooldown_s"],
-                                                 collect_iv=True, stop_event=state.stop_event)
+                                                 collect_iv=True, stop_event=state.stop_event, temp_guard=_linear_temp_guard)
 
             T_now = _get_T(); ts_now = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
             for (I, V) in ivp_list:
@@ -2237,7 +2304,7 @@ def _worker_run_log(state: 'FFState'):
                     pulse_width_s=s["pulse_width_s"], pulse_settle_s=s["pulse_settle_s"], cooldown_s=s["cooldown_s"],
                     sign=-1, collect_iv=True, stop_event=state.stop_event, prev_ic_uA=prev_ic_neg_uA,
                     lower_frac=s["guided_lower_frac"], step_rel=s["guided_step_rel"], min_step_uA=s["guided_min_step_uA"],
-                    window_frac=s["guided_window_frac"], switch_confirm=s["switch_confirm"],
+                    window_frac=s["guided_window_frac"], switch_confirm=s["switch_confirm"], temp_guard=_linear_temp_guard,
                 )
 
                 ivn_band = []
@@ -2246,7 +2313,7 @@ def _worker_run_log(state: 'FFState'):
                                                      s["band_refine_frac_low"], s["band_refine_pts"], s["band_refine_top_margin"],
                                                      s["ic_start_uA"], s["ic_max_uA"],
                                                      s["pulse_width_s"], s["pulse_settle_s"], s["cooldown_s"],
-                                                     collect_iv=True, stop_event=state.stop_event)
+                                                     collect_iv=True, stop_event=state.stop_event, temp_guard=_linear_temp_guard)
 
                 T_now_n = _get_T(); ts_now_n = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                 for (I, V) in ivn_list:
@@ -2334,6 +2401,30 @@ def _worker_run_linear(state: 'FFState'):
         target_temp = float(s.get("target_temp_K", state.T0))
         state.progress_q.put(('status', f"Zero-field IV (linear mode)… T={_get_T():.3f} K"))
 
+        def _linear_temp_guard():
+            if state.stop_event.is_set():
+                return False
+            T = _get_T()
+            if T <= target_temp + s["dT_stop"]:
+                return True
+            try:
+                k.smua.source.leveli = 0.0
+                k.smua.source.output = 0
+            except Exception:
+                pass
+            state.progress_q.put(('status', f"PAUSE (linear, pulse): T={T:.3f} K > {target_temp + s['dT_stop']:.3f} K — SMU off"))
+            while not state.stop_event.is_set():
+                time.sleep(0.5)
+                T = _get_T()
+                try:
+                    k.smua.source.output = 0
+                except Exception:
+                    pass
+                if T <= target_temp + s["dT_resume"]:
+                    return True
+                state.progress_q.put(('status', f"PAUSE (linear, pulse): T={T:.3f} K > {target_temp + s['dT_resume']:.3f} K — waiting"))
+            return False
+
         # ----- B=0 characterization -----
         try:
             if abs(s["coil_start_mA"]) < 1e-6:
@@ -2341,6 +2432,7 @@ def _worker_run_linear(state: 'FFState'):
             else:
                 _coil_set_current_uA(s["coil_start_mA"]*1000.0, ramp_steps=1, settle_s=s["coil_settle_s"])
 
+            state.progress_q.put(('iv_start',))
             Ic0p_uA, _, ivp = _find_ic_uA_guided(
                 v_thresh=s["v_thresh"], start_uA=max(s["ic_start_uA"], s["ic0_min_uA"]),
                 growth=s["ic_growth"], max_uA=s["ic_max_uA"], refine_bits=s["refine_bits"],
@@ -2348,7 +2440,7 @@ def _worker_run_linear(state: 'FFState'):
                 sign=+1, collect_iv=True, stop_event=state.stop_event, prev_ic_uA=None,
                 lower_frac=DEFAULTS["guided_lower_frac"], step_rel=DEFAULTS["guided_step_rel"],
                 min_step_uA=DEFAULTS["guided_min_step_uA"], window_frac=DEFAULTS["guided_window_frac"],
-                switch_confirm=s["switch_confirm"], min_ic_uA=s["ic0_min_uA"],
+                switch_confirm=s["switch_confirm"], min_ic_uA=s["ic0_min_uA"], temp_guard=_linear_temp_guard,
             )
 
             Ic0n_uA, _, ivn = _find_ic_uA_guided(
@@ -2358,7 +2450,7 @@ def _worker_run_linear(state: 'FFState'):
                 sign=-1, collect_iv=True, stop_event=state.stop_event, prev_ic_uA=None,
                 lower_frac=DEFAULTS["guided_lower_frac"], step_rel=DEFAULTS["guided_step_rel"],
                 min_step_uA=DEFAULTS["guided_min_step_uA"], window_frac=DEFAULTS["guided_window_frac"],
-                switch_confirm=s["switch_confirm"], min_ic_uA=s["ic0_min_uA"],
+                switch_confirm=s["switch_confirm"], min_ic_uA=s["ic0_min_uA"], temp_guard=_linear_temp_guard,
             )
 
             for (I,V) in (ivp + ivn):
@@ -2371,25 +2463,26 @@ def _worker_run_linear(state: 'FFState'):
                                                    s["iv0_above_frac"], s["iv0_window_frac"],
                                                    s["ic_start_uA"], s["ic_max_uA"],
                                                    s["pulse_width_s"], s["pulse_settle_s"], s["cooldown_s"],
-                                                   collect_iv=True, stop_event=state.stop_event)
+                                                   collect_iv=True, stop_event=state.stop_event, temp_guard=_linear_temp_guard)
                 iv0_extra += _iv0_refine_around_ic(-1, abs(Ic0n_uA), s["iv0_pts_per_branch"],
                                                    s["iv0_above_frac"], s["iv0_window_frac"],
                                                    s["ic_start_uA"], s["ic_max_uA"],
                                                    s["pulse_width_s"], s["pulse_settle_s"], s["cooldown_s"],
-                                                   collect_iv=True, stop_event=state.stop_event)
+                                                   collect_iv=True, stop_event=state.stop_event, temp_guard=_linear_temp_guard)
             if s["band_refine_enable"]:
                 iv0_band += _refine_band_below_ic(+1, abs(Ic0p_uA),
                                                   s["band_refine_frac_low"], s["band_refine_pts"], s["band_refine_top_margin"],
                                                   s["ic_start_uA"], s["ic_max_uA"],
                                                   s["pulse_width_s"], s["pulse_settle_s"], s["cooldown_s"],
-                                                  collect_iv=True, stop_event=state.stop_event)
+                                                  collect_iv=True, stop_event=state.stop_event, temp_guard=_linear_temp_guard)
                 iv0_band += _refine_band_below_ic(-1, abs(Ic0n_uA),
                                                   s["band_refine_frac_low"], s["band_refine_pts"], s["band_refine_top_margin"],
                                                   s["ic_start_uA"], s["ic_max_uA"],
                                                   s["pulse_width_s"], s["pulse_settle_s"], s["cooldown_s"],
-                                                  collect_iv=True, stop_event=state.stop_event)
+                                                  collect_iv=True, stop_event=state.stop_event, temp_guard=_linear_temp_guard)
 
-            for (I,V) in (iv0_extra + iv0_band):
+            state.progress_q.put(('iv_start',))
+            for (I, V) in (ivp + ivn + iv0_extra + iv0_band):
                 if state.stop_event.is_set(): break
                 state.progress_q.put(('iv', I*1e-6, V))
 
