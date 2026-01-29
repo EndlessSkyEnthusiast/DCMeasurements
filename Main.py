@@ -1603,9 +1603,9 @@ class FFUI:
     ic_ax: object
     ic_canvas: object
     iv_line: object
-    iv_line_latest: object = None
     iv_ax: object
     iv_canvas: object
+    iv_line_latest: object = None
     step_entry: object = None
     jump_entry: object = None
 
