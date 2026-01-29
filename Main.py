@@ -327,6 +327,19 @@ def _tsp_send(dev, cmd: str):
             except Exception: pass
     return False
 
+def _tsp_batch(dev, *cmds):
+    """Send multiple TSP commands in one write to reduce queue load."""
+    parts = []
+    for cmd in cmds:
+        if not cmd:
+            continue
+        text = str(cmd).strip().rstrip(";")
+        if text:
+            parts.append(text)
+    if not parts:
+        return False
+    return _tsp_send(dev, "; ".join(parts))
+
 def _tsp_query(dev, cmd: str):
     """TSP query returning a string (or None)."""
     for m in ("query", "ask"):
@@ -365,6 +378,27 @@ def _drain_errorqueue(dev):
         _tsp_send(dev, "errorqueue.clear()")
     except Exception:
         pass
+
+def _drain_errorqueue_with_log(dev, label="SMU"):
+    """Read and drain errorqueue; log if queue full (-350) was reported."""
+    queue_full = False
+    count = _get_error_count(dev)
+    if count is None or count <= 0:
+        return False
+    for _ in range(int(count)):
+        resp = _tsp_query(dev, "print(errorqueue.next())")
+        if resp is None:
+            continue
+        msg = str(resp).strip()
+        if "-350" in msg or "Queue full" in msg or "queue full" in msg:
+            queue_full = True
+    if queue_full:
+        print(f"[WARN] {label} reported -350 Queue full in errorqueue.")
+    try:
+        _tsp_send(dev, "status.reset()")
+    except Exception:
+        pass
+    return queue_full
 
 def _waitcomplete(dev):
     """Robustes wait, ohne hart zu blockieren wenn Treiber anders heißt."""
@@ -654,23 +688,22 @@ def _junction_pulse_measure_v(I_uA, pulse_width_s, pulse_settle_s, cooldown_s):
     Level nach Messung wieder 0, Output AUS. Nutzt leveli statt apply_current().
     """
     I_A = float(I_uA) * 1e-6
-    _queue_safe_call(
-        k, 'k',
-        lambda: (
-            setattr(k.smua.source, "func", 2),  # current
-            setattr(k.smua.source, "limitv", 0.01),
-            setattr(k.smua.source, "output", 1),
-            _maybe_wait(k, which='k')
-        ),
-        retries=2
-    )
+    def _pulse_output_on():
+        if not _tsp_batch(k, "smua.source.func=2", "smua.source.limitv=0.01", "smua.source.output=1"):
+            setattr(k.smua.source, "func", 2)  # current
+            setattr(k.smua.source, "limitv", 0.01)
+            setattr(k.smua.source, "output", 1)
+        _maybe_wait(k, which='k')
+
+    _queue_safe_call(k, 'k', _pulse_output_on, retries=2)
 
     # Level setzen
-    _queue_safe_call(
-        k, 'k',
-        lambda: (setattr(k.smua.source, "leveli", I_A), _maybe_wait(k, which='k')),
-        retries=2
-    )
+    def _pulse_set_level():
+        if not _tsp_batch(k, f"smua.source.leveli={I_A}"):
+            setattr(k.smua.source, "leveli", I_A)
+        _maybe_wait(k, which='k')
+
+    _queue_safe_call(k, 'k', _pulse_set_level, retries=2)
 
     if pulse_settle_s > 0:
         time.sleep(pulse_settle_s)
@@ -688,15 +721,13 @@ def _junction_pulse_measure_v(I_uA, pulse_width_s, pulse_settle_s, cooldown_s):
         time.sleep(remain)
 
     # Ausgang und Level zurücknehmen (wirklich aus!)
-    _queue_safe_call(
-        k, 'k',
-        lambda: (
-            setattr(k.smua.source, "leveli", 0.0),
-            setattr(k.smua.source, "output", 0),
-            _maybe_wait(k, which='k')
-        ),
-        retries=1
-    )
+    def _pulse_output_off():
+        if not _tsp_batch(k, "smua.source.leveli=0", "smua.source.output=0"):
+            setattr(k.smua.source, "leveli", 0.0)
+            setattr(k.smua.source, "output", 0)
+        _maybe_wait(k, which='k')
+
+    _queue_safe_call(k, 'k', _pulse_output_off, retries=1)
 
     if cooldown_s > 0:
         time.sleep(cooldown_s)
@@ -735,11 +766,11 @@ except NameError:
         _pulse_counter += 1
         if every_pulses and every_pulses > 0 and (_pulse_counter % int(every_pulses) == 0):
             try:
-                _clear_k2600(k)
+                _drain_errorqueue_with_log(k, "SMU1")
             except Exception:
                 pass
             try:
-                _clear_k2600(k2)
+                _drain_errorqueue_with_log(k2, "SMU2")
             except Exception:
                 pass
 
@@ -893,16 +924,14 @@ except NameError:
 def _coil_set_current_uA(target_uA, ramp_steps, settle_s):
     """Coil (SMU2=k2) setzen, Queue-sicher; sehr kleine Steps zusammenfassen."""
     # Sicherstellen: Current-Mode, Output EIN
-    _queue_safe_call(
-        k2, 'k2',
-        lambda: (
-            setattr(k2.smua.source, "func", 2),
-            setattr(k2.smua.source, "limitv", 10.0),
-            setattr(k2.smua.source, "output", 1),
-            _maybe_wait(k2, which='k2')
-        ),
-        retries=2
-    )
+    def _coil_output_on():
+        if not _tsp_batch(k2, "smub.source.func=2", "smub.source.limitv=10.0", "smub.source.output=1"):
+            setattr(k2.smua.source, "func", 2)
+            setattr(k2.smua.source, "limitv", 10.0)
+            setattr(k2.smua.source, "output", 1)
+        _maybe_wait(k2, which='k2')
+
+    _queue_safe_call(k2, 'k2', _coil_output_on, retries=2)
 
     target_uA = float(target_uA)
     ramp_steps = int(max(1, ramp_steps))
@@ -915,20 +944,22 @@ def _coil_set_current_uA(target_uA, ramp_steps, settle_s):
             ramp_steps = max(1, int(abs(target_uA) / min_increment_uA))
 
     if ramp_steps <= 1:
-        _queue_safe_call(
-            k2, 'k2',
-            lambda: (setattr(k2.smua.source, "leveli", target_uA * 1e-6),
-                     _maybe_wait(k2, which='k2')),
-            retries=2
-        )
+        def _coil_set_level():
+            level = target_uA * 1e-6
+            if not _tsp_batch(k2, f"smub.source.leveli={level}"):
+                setattr(k2.smua.source, "leveli", level)
+            _maybe_wait(k2, which='k2')
+
+        _queue_safe_call(k2, 'k2', _coil_set_level, retries=2)
     else:
         for frac in np.linspace(0.0, 1.0, ramp_steps):
-            _queue_safe_call(
-                k2, 'k2',
-                lambda: (setattr(k2.smua.source, "leveli", (frac * target_uA) * 1e-6),
-                         _maybe_wait(k2, which='k2')),
-                retries=2
-            )
+            def _coil_ramp_step(frac=frac):
+                level = (frac * target_uA) * 1e-6
+                if not _tsp_batch(k2, f"smub.source.leveli={level}"):
+                    setattr(k2.smua.source, "leveli", level)
+                _maybe_wait(k2, which='k2')
+
+            _queue_safe_call(k2, 'k2', _coil_ramp_step, retries=2)
 
     if settle_s > 0:
         time.sleep(settle_s)
@@ -936,11 +967,14 @@ def _coil_set_current_uA(target_uA, ramp_steps, settle_s):
 
 def _coil_off():
     """Coil wirklich AUS: Level 0, wait, Output 0."""
+    def _coil_output_off():
+        if not _tsp_batch(k2, "smub.source.leveli=0", "smub.source.output=0"):
+            k2.smua.source.leveli = 0.0
+            k2.smua.source.output = 0
+        _waitcomplete(k2)
+
     try:
-        k2.smua.source.leveli = 0.0
-        _waitcomplete(k2)
-        k2.smua.source.output = 0
-        _waitcomplete(k2)
+        _queue_safe_call(k2, 'k2', _coil_output_off, retries=1)
     except Exception as ex:
         print(f"[WARN] Coil off failed: {ex}")
 
