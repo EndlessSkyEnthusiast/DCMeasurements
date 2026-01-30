@@ -3644,6 +3644,7 @@ def create_current_temp_sweep():
         stop_button.config(state=tk.NORMAL)
 
         def process_queue():
+            global measurement
             try:
                 task = task_queue.get_nowait()
             except queue.Empty:
@@ -3669,9 +3670,9 @@ def create_current_temp_sweep():
                 stop_button.config(state=tk.DISABLED)
                 current_temp_window.destroy()
                 k.smua.source.output = 0
-                k2.smua.source.output = 0
-                global measurement
+                k2.smua.source.output = 0               
                 measurement = 0
+                
 
         def sweep_worker():
             error_message = None
