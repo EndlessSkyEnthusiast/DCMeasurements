@@ -3556,6 +3556,7 @@ def create_current_temp_sweep():
 
     temp_config_frame = tk.Frame(current_temp_window)
     temp_config_frame.pack(pady=10)
+    stop_event = threading.Event()
 
     tk.Label(temp_config_frame, text="Temperatures [K] (comma-separated)").grid(row=0, column=0, padx=5, pady=2, sticky="w")
     temp_list_entry = tk.Entry(temp_config_frame, width=35)
@@ -3636,48 +3637,116 @@ def create_current_temp_sweep():
             if not user_input2:
                 return
 
-        for target_temp in temperatures:
-            if target_temp < 0.5:
+        task_queue = queue.Queue()
+        worker_done = threading.Event()
+        stop_event.clear()
+        start_button.config(state=tk.DISABLED)
+        stop_button.config(state=tk.NORMAL)
+
+        def process_queue():
+            try:
+                task = task_queue.get_nowait()
+            except queue.Empty:
+                if not worker_done.is_set():
+                    current_temp_window.after(200, process_queue)
+                return
+
+            task_type = task.get("type")
+            if task_type == "sweep":
+                if measurement == 0:
+                    task["done_event"].set()
+                else:
+                    run_current_sweep(*task["args"])
+                    task["done_event"].set()
+                current_temp_window.after(50, process_queue)
+            elif task_type == "finish":
+                error_message = task.get("error")
+                if error_message:
+                    messagebox.showerror("Fehler", error_message)
                 if getattr(temperature_control, "is_active", False):
                     temperature_control.stop()
-                    time.sleep(0.5)
-                try:
-                    adr_control.start_adr(setpoint=target_temp, ramp=ramp_speed,
-                                          adr_mode=None, operation_mode='cadr',
-                                          auto_regenerate=True, pre_regenerate=True)
-                except Exception:
-                    pass
-            else:
-                temperature_control.start((target_temp, ramp_speed))
+                start_button.config(state=tk.NORMAL)
+                stop_button.config(state=tk.DISABLED)
+                current_temp_window.destroy()
+                k.smua.source.output = 0
+                k2.smua.source.output = 0
+                global measurement
+                measurement = 0
 
-            while abs((client.query('T_sample.kelvin') or 300) - target_temp) > 0.01:
-                time.sleep(0.2)
-            time.sleep(max(0.0, settle_time))
-            temperature_str = f"{client.query('T_sample.kelvin') or 300:.3f}"
-            user_input_temperature = f"{user_input}_{temperature_str}K_"
-            if use_smu2:
-                user_input_temperature2 = f"{user_input2}_{temperature_str}K_"
-                run_current_sweep(sweep_points, user_input_temperature, user_input_temperature2)
-            else:
-                run_current_sweep(sweep_points, user_input_temperature)
+        def sweep_worker():
+            error_message = None
+            try:
+                for target_temp in temperatures:
+                    if measurement == 0:
+                        break
+                    if target_temp < 0.5:
+                        if getattr(temperature_control, "is_active", False):
+                            temperature_control.stop()
+                            time.sleep(0.5)
+                        try:
+                            adr_control.start_adr(setpoint=target_temp, ramp=ramp_speed,
+                                                  adr_mode=None, operation_mode='cadr',
+                                                  auto_regenerate=True, pre_regenerate=True)
+                        except Exception:
+                            pass
+                    else:
+                        temperature_control.start((target_temp, ramp_speed))
 
-        if getattr(temperature_control, "is_active", False):
-            temperature_control.stop()
-        current_temp_window.destroy()
-        k.smua.source.output = 0
-        k2.smua.source.output = 0
-        global measurement
-        measurement = 0
+                    while measurement == 1 and abs((client.query('T_sample.kelvin') or 300) - target_temp) > 0.01:
+                        time.sleep(0.2)
+                    if measurement == 0:
+                        break
+                    time.sleep(max(0.0, settle_time))
+                    temperature_str = f"{client.query('T_sample.kelvin') or 300:.3f}"
+                    user_input_temperature = f"{user_input}_{temperature_str}K_"
+                    if use_smu2:
+                        user_input_temperature2 = f"{user_input2}_{temperature_str}K_"
+                        done_event = threading.Event()
+                        task_queue.put({
+                            "type": "sweep",
+                            "args": (sweep_points, user_input_temperature, user_input_temperature2, stop_event),
+                            "done_event": done_event,
+                        })
+                    else:
+                        done_event = threading.Event()
+                        task_queue.put({
+                            "type": "sweep",
+                            "args": (sweep_points, user_input_temperature, None, stop_event),
+                            "done_event": done_event,
+                        })
+                    done_event.wait()
+            except Exception as exc:
+                error_message = str(exc)
+            finally:
+                task_queue.put({"type": "finish", "error": error_message})
+                worker_done.set()
+
+        threading.Thread(target=sweep_worker, daemon=True).start()
+        current_temp_window.after(200, process_queue)
 
     controls_frame = tk.Frame(current_temp_window)
     controls_frame.pack(fill=tk.X)
+
+    def stop_current_temp_sweep():
+        global measurement
+        measurement = 0
+        stop_event.set()
+        stop_button.config(state=tk.DISABLED)
 
     local_remote_checkbox = tk.Checkbutton(controls_frame, text="4 Point", variable=local_remote_var)
     local_remote_checkbox.pack(side=tk.LEFT)
     smu2_checkbox = tk.Checkbutton(controls_frame, text="Use SMU2", variable=use_smu2_var)
     smu2_checkbox.pack(side=tk.LEFT)
     tk.Button(controls_frame, text="Add Section (Current)", command=add_current_section).pack(side=tk.LEFT)
-    tk.Button(controls_frame, text="Measurement start", command=run_current_temp_sweep).pack(side=tk.RIGHT)
+    stop_button = tk.Button(
+        controls_frame,
+        text="Save'n Stop",
+        state=tk.DISABLED,
+        command=stop_current_temp_sweep,
+    )
+    stop_button.pack(side=tk.LEFT)
+    start_button = tk.Button(controls_frame, text="Measurement start", command=run_current_temp_sweep)
+    start_button.pack(side=tk.RIGHT)
 
     return current_temp_window
 
@@ -4956,7 +5025,7 @@ def load_sweep_current():
                 section_frames.append(frame)
                 
 
-def run_current_sweep(sweep_points, user_input,user_input2=None):
+def run_current_sweep(sweep_points, user_input, user_input2=None, stop_event=None):
     global measurement
     measurement = 1
     if local_remote_var.get() == 1:
@@ -5021,7 +5090,12 @@ def run_current_sweep(sweep_points, user_input,user_input2=None):
     if use_smu2:
         ani2 = FuncAnimation(fig2, update_iv_plot2, frames=10000, repeat=False, interval=5000)
         ani2._start()
+    def should_stop():
+        return (stop_event is not None and stop_event.is_set()) or measurement == 0
+
     for start, end, steps in sweep_points:
+        if should_stop():
+            break
         currents = [round(start + (end - start) * j / steps, 14) for j in range(steps)]
         k.smua.source.output = 1
         k.smua.source.func = 2 # Set source function to current
@@ -5031,6 +5105,8 @@ def run_current_sweep(sweep_points, user_input,user_input2=None):
             k2.smua.source.func = 2  # Set source function to current
             k2.smua.measure.nplc = integrationtime
         for current in currents:
+            if should_stop():
+                break
             k.apply_current(k.smua, current)
             if use_smu2:
                 k2.apply_current(k2.smua, current)
