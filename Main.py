@@ -3516,6 +3516,171 @@ def IV_Temp():
 iv_section_frames = []  # List to hold the frames for IV sweep data
 temp_section_frames = []  # List to hold the frames for temperature data
 
+#%% Cell 6b: Temperature dependent Current Sweep
+def _parse_temperature_list(text):
+    temps = []
+    for item in text.split(","):
+        value = item.strip()
+        if not value:
+            continue
+        temps.append(float(value))
+    return temps
+
+def _generate_temperature_steps(start_temp, end_temp, intermediate_steps):
+    if intermediate_steps < 0:
+        raise ValueError("Intermediate steps must be >= 0")
+    if intermediate_steps == 0:
+        if start_temp == end_temp:
+            return [start_temp]
+        return [start_temp, end_temp]
+    return np.linspace(start_temp, end_temp, intermediate_steps + 2).tolist()
+
+def create_current_temp_sweep():
+    global measurement
+    measurement = 1
+
+    current_temp_window = tk.Toplevel(root)
+    current_temp_window.title("Current Sweep at Different Temperatures")
+    current_temp_window.protocol("WM_DELETE_WINDOW", lambda: on_closing(current_temp_window))
+
+    sweep_sections_frame = tk.Frame(current_temp_window)
+    sweep_sections_frame.pack()
+
+    def add_current_section():
+        frame = create_section_frame(sweep_sections_frame)
+        frame.pack(fill=tk.X)
+        sweep_section_frames.append(frame)
+
+    sweep_section_frames = []
+    add_current_section()
+
+    temp_config_frame = tk.Frame(current_temp_window)
+    temp_config_frame.pack(pady=10)
+
+    tk.Label(temp_config_frame, text="Temperatures [K] (comma-separated)").grid(row=0, column=0, padx=5, pady=2, sticky="w")
+    temp_list_entry = tk.Entry(temp_config_frame, width=35)
+    temp_list_entry.grid(row=0, column=1, columnspan=3, padx=5, pady=2, sticky="w")
+
+    tk.Label(temp_config_frame, text="Start [K]").grid(row=1, column=0, padx=5, pady=2, sticky="w")
+    start_temp_entry = tk.Entry(temp_config_frame, width=10)
+    start_temp_entry.grid(row=1, column=1, padx=5, pady=2, sticky="w")
+
+    tk.Label(temp_config_frame, text="End [K]").grid(row=1, column=2, padx=5, pady=2, sticky="w")
+    end_temp_entry = tk.Entry(temp_config_frame, width=10)
+    end_temp_entry.grid(row=1, column=3, padx=5, pady=2, sticky="w")
+
+    tk.Label(temp_config_frame, text="Intermediate Steps").grid(row=2, column=0, padx=5, pady=2, sticky="w")
+    steps_entry = tk.Entry(temp_config_frame, width=10)
+    steps_entry.grid(row=2, column=1, padx=5, pady=2, sticky="w")
+    steps_entry.insert(0, "0")
+
+    tk.Label(temp_config_frame, text="Ramp Speed [K/min]").grid(row=2, column=2, padx=5, pady=2, sticky="w")
+    ramp_speed_entry = tk.Entry(temp_config_frame, width=10)
+    ramp_speed_entry.grid(row=2, column=3, padx=5, pady=2, sticky="w")
+    ramp_speed_entry.insert(0, "1")
+
+    tk.Label(temp_config_frame, text="Thermalization Time [s]").grid(row=3, column=0, padx=5, pady=2, sticky="w")
+    settle_entry = tk.Entry(temp_config_frame, width=10)
+    settle_entry.grid(row=3, column=1, padx=5, pady=2, sticky="w")
+    settle_entry.insert(0, "60")
+
+    def run_current_temp_sweep():
+        sweep_points = []
+        for frame in sweep_section_frames:
+            try:
+                start_value = frame.winfo_children()[1].get()
+                end_value = frame.winfo_children()[3].get()
+                steps_value = frame.winfo_children()[5].get()
+                start = float(start_value) * (10 ** -6)
+                end = float(end_value) * (10 ** -6)
+                steps = int(steps_value)
+                sweep_points.append((start, end, steps))
+            except ValueError:
+                tk.messagebox.showerror("Fehler", "Ungültige Eingabe für den Strom-Sweep.")
+                return
+            except tk.TclError as e:
+                if "bad window path name" not in str(e):
+                    raise e
+
+        try:
+            ramp_speed = float(ramp_speed_entry.get())
+            settle_time = float(settle_entry.get())
+        except ValueError:
+            tk.messagebox.showerror("Fehler", "Ungültige Eingabe für Ramp Speed oder Thermalization Time.")
+            return
+
+        temp_list_text = temp_list_entry.get().strip()
+        try:
+            if temp_list_text:
+                temperatures = _parse_temperature_list(temp_list_text)
+            else:
+                start_temp = float(start_temp_entry.get())
+                end_temp = float(end_temp_entry.get())
+                intermediate_steps = int(steps_entry.get())
+                temperatures = _generate_temperature_steps(start_temp, end_temp, intermediate_steps)
+        except ValueError:
+            tk.messagebox.showerror("Fehler", "Ungültige Temperatureingabe.")
+            return
+
+        if not temperatures:
+            tk.messagebox.showerror("Fehler", "Bitte mindestens eine Temperatur angeben.")
+            return
+
+        user_input = simpledialog.askstring("Insert Filename", "Please insert the file Name for SMU1:")
+        if not user_input:
+            return
+        use_smu2 = use_smu2_var.get()
+        user_input2 = None
+        if use_smu2:
+            user_input2 = simpledialog.askstring("Insert Filename", "Please insert the file Name for SMU2:")
+            if not user_input2:
+                return
+
+        for target_temp in temperatures:
+            if target_temp < 0.5:
+                if getattr(temperature_control, "is_active", False):
+                    temperature_control.stop()
+                    time.sleep(0.5)
+                try:
+                    adr_control.start_adr(setpoint=target_temp, ramp=ramp_speed,
+                                          adr_mode=None, operation_mode='cadr',
+                                          auto_regenerate=True, pre_regenerate=True)
+                except Exception:
+                    pass
+            else:
+                temperature_control.start((target_temp, ramp_speed))
+
+            while abs((client.query('T_sample.kelvin') or 300) - target_temp) > 0.01:
+                time.sleep(0.2)
+            time.sleep(max(0.0, settle_time))
+            temperature_str = f"{client.query('T_sample.kelvin') or 300:.3f}"
+            user_input_temperature = f"{user_input}_{temperature_str}K_"
+            if use_smu2:
+                user_input_temperature2 = f"{user_input2}_{temperature_str}K_"
+                run_current_sweep(sweep_points, user_input_temperature, user_input_temperature2)
+            else:
+                run_current_sweep(sweep_points, user_input_temperature)
+
+        if getattr(temperature_control, "is_active", False):
+            temperature_control.stop()
+        current_temp_window.destroy()
+        k.smua.source.output = 0
+        k2.smua.source.output = 0
+        global measurement
+        measurement = 0
+
+    controls_frame = tk.Frame(current_temp_window)
+    controls_frame.pack(fill=tk.X)
+
+    local_remote_checkbox = tk.Checkbutton(controls_frame, text="4 Point", variable=local_remote_var)
+    local_remote_checkbox.pack(side=tk.LEFT)
+    smu2_checkbox = tk.Checkbutton(controls_frame, text="Use SMU2", variable=use_smu2_var)
+    smu2_checkbox.pack(side=tk.LEFT)
+    tk.Button(controls_frame, text="Add Section (Current)", command=add_current_section).pack(side=tk.LEFT)
+    tk.Button(controls_frame, text="Measurement start", command=run_current_temp_sweep).pack(side=tk.RIGHT)
+
+    return current_temp_window
+
 #%% Cell 7: 4 Point Tc Measurement Force
 #4PointTcMeasurement
 
@@ -6110,6 +6275,7 @@ add_button_with_details_and_load(
 add_button_with_details_and_load(iv_frame, "Single IV Curve Current", create_sweep_current, "Start: Start Current in muA, End: End Current in muA, Steps: Amount of Steps (Integer). Checkbox Unchecked: Connect SMU1 HI and SMU1 LO to your device. Checkbox Checked: Connect SMU1 HI and SMU1 LO to your device as outer electrodes and SMU1 Sense Hi and SMU1 Sense Lo as inner electrodes. Range: -0.1A;0.1A",load_sweep_current)
 add_button_with_details_and_load(iv_frame, "Single IV Curve Voltage", create_sweep, "Start: Start Voltage, End: End Voltage, Steps: Amount of Steps (Integer). Connect SMU1 HI and SMU1 LO to your device. Range: -20V;20V",load_sweep)
 add_button_with_details(tc_frame, "Voltage sweep at several temperatures", IV_Temp, "Connect SMU1 HI and SMU1 LO to your device. Range: -20;20V, 0.2K;290K")
+add_button_with_details(tc_frame, "Current sweep at several temperatures", create_current_temp_sweep, "Current sweep in µA at multiple temperatures. Provide either a comma-separated temperature list or start/end with intermediate steps. Thermalization time applies after reaching the temperature. Uses temperature control unless target < 0.5 K.")
 add_button_with_details(tc_frame, "2 Point Tc Measurement", create_tc_measurement, "Connect SMU1 HI and SMU1 LO to your device. Range: 1muA;100mA, 0.2K;290K, high power might reduce Temperature Range. Recommended: 100muA")
 add_button_with_details(tc_frame, "4-point Tc Measurement 2 SMU Classic", create_4ptc_measurement, "Connect SMU1 HI and SMU1 LO to your device as outer electrodes and SMU2 HI and SMU2 Lo as inner electrodes. Range 1muA;100mA, 0.2K;290K, high power might reduce Temperature Range. Recommended: 100muA")
 add_button_with_details(tc_frame, "4-point Tc Measurement 1 SMU Sense", create_4pt_measurement_Sense, "Connect SMU1 HI and SMU1 LO to your device as outer electrodes and SMU1 Sense Hi and SMU1 Sense Lo as inner electrodes. The Hi and Lo should be in Order SMU1 Hi SMU1 Sense Hi SMU1 Sense LO SMU1 LO Range: 1muA;100mA, 0.2K;290K, high power might reduce Temperature Range. Recommended: 100muA")
