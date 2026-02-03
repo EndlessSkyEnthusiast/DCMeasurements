@@ -4347,7 +4347,7 @@ def create_parallel_4pt_measurement_Sense():
 
     # -------------------- Config helpers --------------------
     
-    def _conf_low_noise(dev, nplc=1.0, filter_count=10, autozero_on=True, v_range_V=None):
+    def _conf_low_noise(dev, nplc=1.0, filter_count=10, autozero_on=True, v_range_V=None, sense_remote=True):
         """
         Configure Keithley 2635 for low-noise voltage readout while sourcing current:
           - Long integration (NPLC)
@@ -4356,7 +4356,7 @@ def create_parallel_4pt_measurement_Sense():
           - Optional fixed voltage range (turns OFF autorange for cleaner data)
         """
         try:
-            dev.smua.sense = dev.smua.SENSE_REMOTE
+            dev.smua.sense = dev.smua.SENSE_REMOTE if sense_remote else dev.smua.SENSE_LOCAL
         except Exception:
             pass
 
@@ -4454,6 +4454,8 @@ def create_parallel_4pt_measurement_Sense():
     # These checkboxes let you choose SMU1 / SMU2 independently.
     smu1_on_var = tk.IntVar(master=root, value=1)
     smu2_on_var = tk.IntVar(master=root, value=1)
+    smu1_4wire_var = tk.IntVar(master=root, value=1)
+    smu2_4wire_var = tk.IntVar(master=root, value=1)
 
     # Defaults/noise options (you can tweak as you like)
     nplc_var          = tk.DoubleVar(master=root,value=1.0)   # longer = quieter
@@ -4461,17 +4463,6 @@ def create_parallel_4pt_measurement_Sense():
     autozero_var      = tk.IntVar(master=root,value=1)        # ON = 1 (quieter)
     vrange_mV_var     = tk.StringVar(master=root,value="10")  # fixed V-range in mV (empty = autorange)
     extra_reads_var   = tk.IntVar(master=root,value=3)        # additional host-side averaging per data point
-
-    # -------------------- Existing sense defaults --------------------
-    # Set 4-wire remote sense by default; we’ll still apply per-SMU config later.
-    try:
-        k.smua.sense = k.smua.SENSE_REMOTE
-    except Exception:
-        pass
-    try:
-        k2.smua.sense = k2.smua.SENSE_REMOTE
-    except Exception:
-        pass
 
     # Flags für manuellen Modus (Advanced-Feature)
     manual_mode = False
@@ -4571,9 +4562,23 @@ def create_parallel_4pt_measurement_Sense():
 
             # Configure selected SMUs for low noise
             if smu1_on_var.get():
-                _conf_low_noise(k, nplc=nplc_val, filter_count=filt_count, autozero_on=autozero_on, v_range_V=v_range_V)
+                _conf_low_noise(
+                    k,
+                    nplc=nplc_val,
+                    filter_count=filt_count,
+                    autozero_on=autozero_on,
+                    v_range_V=v_range_V,
+                    sense_remote=bool(smu1_4wire_var.get()),
+                )
             if smu2_on_var.get():
-                _conf_low_noise(k2, nplc=nplc_val, filter_count=filt_count, autozero_on=autozero_on, v_range_V=v_range_V)
+                _conf_low_noise(
+                    k2,
+                    nplc=nplc_val,
+                    filter_count=filt_count,
+                    autozero_on=autozero_on,
+                    v_range_V=v_range_V,
+                    sense_remote=bool(smu2_4wire_var.get()),
+                )
 
             # Abschnitte einsammeln
             tc_data = []
@@ -4876,6 +4881,8 @@ def create_parallel_4pt_measurement_Sense():
 
     tk.Checkbutton(top_opts, text="Use SMU1", variable=smu1_on_var).grid(row=0, column=0, padx=6, pady=4, sticky="w")
     tk.Checkbutton(top_opts, text="Use SMU2", variable=smu2_on_var).grid(row=0, column=1, padx=6, pady=4, sticky="w")
+    tk.Checkbutton(top_opts, text="SMU1 4-point", variable=smu1_4wire_var).grid(row=0, column=2, padx=6, pady=4, sticky="w")
+    tk.Checkbutton(top_opts, text="SMU2 4-point", variable=smu2_4wire_var).grid(row=0, column=3, padx=6, pady=4, sticky="w")
 
     tk.Label(top_opts, text="NPLC").grid(row=1, column=0, sticky="e")
     tk.Entry(top_opts, textvariable=nplc_var, width=8).grid(row=1, column=1, sticky="w", padx=4)
