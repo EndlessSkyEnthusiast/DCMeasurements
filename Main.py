@@ -317,6 +317,12 @@ class FFState:
 _ff_state = None
 _ERR_DRAIN_EVERY = DEFAULTS["error_drain_every_pulses"]
 _pulse_counter = 0
+PULSE_FETCH_CHUNK = 400
+_TSP_PULSE_VERSION = "pulse_batch_v1"
+_tsp_pulse_loaded_devices = set()
+_tsp_pulse_disabled = False
+_tsp_pulse_warned = False
+_pulse_nplc_current = float(DEFAULTS.get("nplc", 0.01))
 
 # -------- Low-level TSP I/O --------
 def _tsp_send(dev, cmd: str):
@@ -698,6 +704,8 @@ def _stable_block_s(ref_T, duration_s):
 
 def _prep_pulse_smua(k, nplc=0.01, limit_v=0.01):
     """SMU1 (Junction) vorbereiten: schneller Measure, Ausgang auf 0 A, Output AUS."""
+    global _pulse_nplc_current
+    _pulse_nplc_current = float(nplc)
     try:
         k.smua.source.func = 2              # current mode
         k.smua.source.autorangei = 1        # autorange current
@@ -712,7 +720,280 @@ def _prep_pulse_smua(k, nplc=0.01, limit_v=0.01):
 
 #%% BLOCK 2/4 — PULSED PRIMITIVES, IC SEARCH, REFINEMENTS + UI FRAMES
 
-def _junction_pulse_measure_v(I_uA, pulse_width_s, pulse_settle_s, cooldown_s):
+def _tsp_pulse_script(name: str, version: str) -> str:
+    return f"""
+loadscript {name}
+_pulse_batch_version = "{version}"
+function _pulse_setup(limitv, nplc)
+    smua.source.func = smua.OUTPUT_DCAMPS
+    smua.source.autorangei = smua.AUTORANGE_ON
+    smua.source.limitv = limitv
+    smua.measure.nplc = nplc
+    smua.source.leveli = 0
+    smua.nvbuffer1.clear()
+    smua.nvbuffer1.appendmode = 1
+    smua.nvbuffer2.clear()
+    smua.nvbuffer2.appendmode = 1
+end
+function _pulse_list_values(csv)
+    local t = {{}}
+    if csv == nil then return t end
+    for val in string.gmatch(csv, "([^,]+)") do
+        local num = tonumber(val)
+        if num ~= nil then
+            table.insert(t, num)
+        end
+    end
+    return t
+end
+function pulse_const(i, n, pw, settle, cooldown, limitv, nplc, outoff)
+    _pulse_setup(limitv, nplc)
+    smua.source.output = 1
+    for j = 1, n do
+        smua.source.leveli = i
+        if settle > 0 then delay(settle) end
+        smua.measure.v(smua.nvbuffer1)
+        local remain = pw - settle
+        if remain > 0 then delay(remain) end
+        smua.source.leveli = 0
+        if cooldown > 0 then delay(cooldown) end
+    end
+    smua.source.leveli = 0
+    if outoff == 1 then smua.source.output = 0 end
+end
+function pulse_list(csv, n, pw, settle, cooldown, limitv, nplc, outoff)
+    local values = _pulse_list_values(csv)
+    local total = n
+    if total == nil or total <= 0 then total = #values end
+    if total > #values then total = #values end
+    _pulse_setup(limitv, nplc)
+    smua.source.output = 1
+    for j = 1, total do
+        local i = values[j] or 0
+        smua.source.leveli = i
+        if settle > 0 then delay(settle) end
+        smua.measure.v(smua.nvbuffer1)
+        local remain = pw - settle
+        if remain > 0 then delay(remain) end
+        smua.source.leveli = 0
+        if cooldown > 0 then delay(cooldown) end
+    end
+    smua.source.leveli = 0
+    if outoff == 1 then smua.source.output = 0 end
+end
+function sweep_list(csv, n, settle, limitv, nplc, outoff)
+    local values = _pulse_list_values(csv)
+    local total = n
+    if total == nil or total <= 0 then total = #values end
+    if total > #values then total = #values end
+    _pulse_setup(limitv, nplc)
+    smua.source.output = 1
+    for j = 1, total do
+        local i = values[j] or 0
+        smua.source.leveli = i
+        if settle > 0 then delay(settle) end
+        smua.measure.v(smua.nvbuffer1)
+        smua.measure.i(smua.nvbuffer2)
+    end
+    smua.source.leveli = 0
+    if outoff == 1 then smua.source.output = 0 end
+end
+endscript
+runscript {name}
+"""
+
+def _ensure_tsp_pulse_script_loaded(dev=k):
+    global _tsp_pulse_loaded_devices, _tsp_pulse_disabled
+    if _tsp_pulse_disabled:
+        return False
+    dev_key = id(dev)
+    if dev_key in _tsp_pulse_loaded_devices:
+        return True
+    script = _tsp_pulse_script("pulse_batch", _TSP_PULSE_VERSION)
+    try:
+        if not _tsp_send(dev, script):
+            raise RuntimeError("TSP script write failed")
+        resp = _tsp_query(dev, "print(_pulse_batch_version)")
+        if resp is None or _TSP_PULSE_VERSION not in str(resp):
+            raise RuntimeError("TSP script version check failed")
+        _tsp_pulse_loaded_devices.add(dev_key)
+        return True
+    except Exception as ex:
+        _tsp_pulse_disabled = True
+        _warn_tsp_disabled(f"script load failed: {ex}")
+        return False
+
+def _warn_tsp_disabled(reason: str):
+    global _tsp_pulse_warned
+    if _tsp_pulse_warned:
+        return
+    _tsp_pulse_warned = True
+    print(f"[WARN] TSP pulse mode disabled ({reason}); falling back to legacy per-pulse commands.")
+
+def _parse_printbuffer_values(text):
+    if text is None:
+        return []
+    raw = str(text).strip()
+    if not raw:
+        return []
+    parts = []
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        parts.extend(line.replace(",", " ").split())
+    values = []
+    for part in parts:
+        try:
+            values.append(float(part))
+        except Exception:
+            continue
+    return values
+
+def _printbuffer_chunked(dev, buffer_name, field, start, end, chunk=PULSE_FETCH_CHUNK):
+    values = []
+    if end < start:
+        return values
+    for i in range(int(start), int(end) + 1, int(chunk)):
+        j = min(int(end), i + int(chunk) - 1)
+        resp = _tsp_query(dev, f"printbuffer({i},{j},{buffer_name}.{field})")
+        values.extend(_parse_printbuffer_values(resp))
+    return values
+
+def _drain_errors_periodic_batch(count: int):
+    global _pulse_counter
+    count = int(count)
+    if count <= 0:
+        return
+    before = _pulse_counter
+    _pulse_counter += count
+    if _ERR_DRAIN_EVERY and _ERR_DRAIN_EVERY > 0:
+        if (_pulse_counter // _ERR_DRAIN_EVERY) != (before // _ERR_DRAIN_EVERY):
+            try:
+                _drain_errorqueue_with_log(k, "SMU1")
+            except Exception:
+                pass
+            try:
+                _drain_errorqueue_with_log(k2, "SMU2")
+            except Exception:
+                pass
+
+def _run_pulses_internal(currents_A, pw_s, settle_s, cooldown_s, limit_v=0.01, outoff=True, nplc=None):
+    currents_A = list(currents_A)
+    n = len(currents_A)
+    if n == 0:
+        return []
+    if nplc is None:
+        nplc = _pulse_nplc_current
+    if not _ensure_tsp_pulse_script_loaded(k):
+        return _run_pulses_legacy(currents_A, pw_s, settle_s, cooldown_s)
+    try:
+        outoff_flag = 1 if outoff else 0
+        print(f"[TSP] pulse batch N={n}")
+        if all(abs(i - currents_A[0]) <= 1e-15 for i in currents_A):
+            cmd = (
+                f"pulse_const({currents_A[0]:.9e},{n},{pw_s:.9e},{settle_s:.9e},{cooldown_s:.9e},"
+                f"{limit_v:.9e},{float(nplc):.9e},{outoff_flag})"
+            )
+        else:
+            csv = ",".join(f"{i:.9e}" for i in currents_A)
+            cmd = (
+                f"pulse_list(\"{csv}\",{n},{pw_s:.9e},{settle_s:.9e},{cooldown_s:.9e},"
+                f"{limit_v:.9e},{float(nplc):.9e},{outoff_flag})"
+            )
+        sent = _queue_safe_call(k, 'k', lambda: _tsp_send(k, cmd), retries=1, fallback=False)
+        if not sent:
+            raise RuntimeError("TSP pulse list send failed")
+        _waitcomplete(k)
+        values = _printbuffer_chunked(k, "smua.nvbuffer1", "readings", 1, n)
+        if len(values) < n:
+            values.extend([float("nan")] * (n - len(values)))
+        _drain_errors_periodic_batch(n)
+        return values
+    except Exception as ex:
+        global _tsp_pulse_disabled
+        _tsp_pulse_disabled = True
+        _warn_tsp_disabled(f"pulse run failed: {ex}")
+        return _run_pulses_legacy(currents_A, pw_s, settle_s, cooldown_s)
+
+def _run_pulses_legacy(currents_A, pw_s, settle_s, cooldown_s):
+    out = []
+    for current_A in currents_A:
+        out.append(_junction_pulse_measure_v_legacy(current_A * 1e6, pw_s, settle_s, cooldown_s))
+    return out
+
+def _run_iv_sweep_internal(dev, currents_A, settle_s, limit_v=0.02, outoff=False, nplc=None):
+    currents_A = list(currents_A)
+    n = len(currents_A)
+    if n == 0:
+        return []
+    if nplc is None:
+        nplc = _pulse_nplc_current
+    if not _ensure_tsp_pulse_script_loaded(dev):
+        return _run_iv_sweep_legacy(dev, currents_A, settle_s, limit_v, nplc, outoff)
+    try:
+        csv = ",".join(f"{i:.9e}" for i in currents_A)
+        outoff_flag = 1 if outoff else 0
+        print(f"[TSP] sweep batch N={n}")
+        cmd = (
+            f"sweep_list(\"{csv}\",{n},{settle_s:.9e},{limit_v:.9e},{float(nplc):.9e},{outoff_flag})"
+        )
+        which = 'k' if dev is k else 'k2'
+        sent = _queue_safe_call(dev, which, lambda: _tsp_send(dev, cmd), retries=1, fallback=False)
+        if not sent:
+            raise RuntimeError("TSP sweep send failed")
+        _waitcomplete(dev)
+        v_vals = _printbuffer_chunked(dev, "smua.nvbuffer1", "readings", 1, n)
+        i_vals = _printbuffer_chunked(dev, "smua.nvbuffer2", "readings", 1, n)
+        if len(v_vals) < n:
+            v_vals.extend([float("nan")] * (n - len(v_vals)))
+        if len(i_vals) < n:
+            i_vals.extend(currents_A[len(i_vals):])
+        _drain_errors_periodic_batch(n)
+        return list(zip(i_vals[:n], v_vals[:n]))
+    except Exception as ex:
+        global _tsp_pulse_disabled
+        _tsp_pulse_disabled = True
+        _warn_tsp_disabled(f"sweep run failed: {ex}")
+        return _run_iv_sweep_legacy(dev, currents_A, settle_s, limit_v, nplc, outoff)
+
+def _run_iv_sweep_legacy(dev, currents_A, settle_s, limit_v, nplc, outoff):
+    results = []
+    try:
+        dev.smua.source.func = 2
+        dev.smua.source.limitv = float(limit_v)
+        dev.smua.measure.nplc = float(nplc)
+        dev.smua.source.output = 1
+    except Exception:
+        pass
+    for current_A in currents_A:
+        try:
+            dev.smua.source.leveli = float(current_A)
+        except Exception:
+            try:
+                k.apply_current(dev.smua, float(current_A))
+            except Exception:
+                pass
+        if settle_s > 0:
+            time.sleep(settle_s)
+        try:
+            i_meas, v_meas = dev.smua.measure.iv()
+        except Exception:
+            try:
+                i_meas = dev.smua.measure.i()
+                v_meas = dev.smua.measure.v()
+            except Exception:
+                i_meas, v_meas = float("nan"), float("nan")
+        results.append((float(i_meas), float(v_meas)))
+    if outoff:
+        try:
+            dev.smua.source.leveli = 0
+            dev.smua.source.output = 0
+        except Exception:
+            pass
+    return results
+
+def _junction_pulse_measure_v_legacy(I_uA, pulse_width_s, pulse_settle_s, cooldown_s):
     """
     Saubere Pulse auf SMU1 (k): Output nur für die Pulse EIN,
     Level nach Messung wieder 0, Output AUS. Nutzt leveli statt apply_current().
@@ -767,6 +1048,25 @@ def _junction_pulse_measure_v(I_uA, pulse_width_s, pulse_settle_s, cooldown_s):
 
     return v
 
+
+def _junction_pulse_measure_v_batch(I_uA_list, pulse_width_s, pulse_settle_s, cooldown_s):
+    if not I_uA_list:
+        return []
+    currents_A = [float(i) * 1e-6 for i in I_uA_list]
+    return _run_pulses_internal(currents_A, pulse_width_s, pulse_settle_s, cooldown_s, limit_v=0.01, outoff=True)
+
+def _junction_pulse_measure_v(I_uA, pulse_width_s, pulse_settle_s, cooldown_s):
+    values = _junction_pulse_measure_v_batch([I_uA], pulse_width_s, pulse_settle_s, cooldown_s)
+    if not values:
+        return float("nan")
+    return values[0]
+
+def _junction_pulse_measure_v_batch_guarded(I_uA_list, pulse_width_s, pulse_settle_s, cooldown_s, temp_guard=None):
+    if temp_guard:
+        ok = temp_guard()
+        if not ok:
+            return [None for _ in I_uA_list]
+    return _junction_pulse_measure_v_batch(I_uA_list, pulse_width_s, pulse_settle_s, cooldown_s)
 
 def _junction_pulse_measure_v_guarded(I_uA, pulse_width_s, pulse_settle_s, cooldown_s, temp_guard=None):
     if temp_guard:
@@ -1080,8 +1380,12 @@ def _confirm_switch_same_I(sign, IuA, pulse_width_s, pulse_settle_s, cooldown_s,
     """Mehrfachmessung am selben I: akzepte nur, wenn genügend Wiederholungen ≥ rel*Vthresh."""
     thr = float(v_thresh) * float(rel_thresh)
     hits = 0
-    for _ in range(int(extra_pulses)):
-        v2 = _junction_pulse_measure_v_guarded(sign * float(IuA), pulse_width_s, pulse_settle_s, cooldown_s, temp_guard)
+    n = int(extra_pulses)
+    currents = [sign * float(IuA)] * n
+    values = _junction_pulse_measure_v_batch_guarded(currents, pulse_width_s, pulse_settle_s, cooldown_s, temp_guard)
+    if values is None:
+        return False
+    for v2 in values:
         if v2 is None:
             return False
         if collect_iv and iv_sink is not None:
@@ -1218,11 +1522,10 @@ def _refine_band_below_ic(sign, ic_uA, frac_low, npts, top_margin,
 
     currents = np.linspace(lo_uA, hi_uA, int(npts)) * float(sign)
     iv_list = []
-
-    for I in currents:
-        if stop_event.is_set():
-            break
-        v = _junction_pulse_measure_v_guarded(I, pulse_width_s, pulse_settle_s, cooldown_s, temp_guard)
+    if stop_event.is_set():
+        return iv_list
+    values = _junction_pulse_measure_v_batch_guarded(currents, pulse_width_s, pulse_settle_s, cooldown_s, temp_guard)
+    for I, v in zip(currents, values):
         if v is None:
             break
         if collect_iv:
@@ -1256,12 +1559,15 @@ def _iv0_refine_around_ic(sign, Ic_uA, pts, above_frac, window_frac,
     below = np.linspace(lo, Ic, n_below, endpoint=False)
     above = np.linspace(Ic, hi, n_above, endpoint=True)
     grid  = np.concatenate([below, above]); out = []
-    for IuA in grid:
-        if stop_event and stop_event.is_set(): break
-        v = _junction_pulse_measure_v_guarded(sign * IuA, pulse_width_s, pulse_settle_s, cooldown_s, temp_guard)
+    if stop_event and stop_event.is_set():
+        return out
+    currents = [sign * float(IuA) for IuA in grid]
+    values = _junction_pulse_measure_v_batch_guarded(currents, pulse_width_s, pulse_settle_s, cooldown_s, temp_guard)
+    for IuA, v in zip(currents, values):
         if v is None:
             break
-        if collect_iv: out.append((sign * IuA, v))
+        if collect_iv:
+            out.append((IuA, v))
     return out
 
 
@@ -5592,74 +5898,104 @@ def Find_JJ():
         xs_pos_tow,  ys_pos_tow  = [], []
         xs_neg_away, ys_neg_away = [], []
         xs_neg_tow,  ys_neg_tow  = [], []
+        batch_size = int(params.get("batch_size", 200))
 
         def _guard_T():
             return (_tempK() <= T0 + dT_max)
 
-        # + branch up (find Ic+): away from 0
-        for I in _soft_ramp_sequence(I0, Imax, grow=grow, min_step_uA=min_step):
-            if stop_event.is_set() or not ui_alive(): break
-            if not _guard_T():
-                ui_set_status(f"{dev_name}: ΔT exceeded. Stopping.")
-                break
-            _apply_I(dev, +I)
-            if settle_s > 0: time.sleep(settle_s)
-            i, v = _meas_iv(dev)
+        def _append_point(i_meas, v_meas, branch, phase, direction):
             ts, Tk = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'), _tempK()
-            results_search.append((ts, f"{Tk:.6f}", f"{i:.12e}", f"{v:.12e}", '+', 'ramp_up', 'away'))
-            xs_pos_away.append(i); ys_pos_away.append(v); ui_plot_update("pos_away", xs_pos_away[:], ys_pos_away[:])
-            if abs(v) >= Vth:
-                markers["Ic_plus"] = i
-                ui_annotate_x(i, "Ic_plus", "#cc0000")
-                break
+            results_search.append((ts, f"{Tk:.6f}", f"{i_meas:.12e}", f"{v_meas:.12e}", branch, phase, direction))
+            if branch == '+':
+                if direction == 'away':
+                    xs_pos_away.append(i_meas); ys_pos_away.append(v_meas); ui_plot_update("pos_away", xs_pos_away[:], ys_pos_away[:])
+                else:
+                    xs_pos_tow.append(i_meas); ys_pos_tow.append(v_meas); ui_plot_update("pos_towards", xs_pos_tow[:], ys_pos_tow[:])
+            else:
+                if direction == 'away':
+                    xs_neg_away.append(i_meas); ys_neg_away.append(v_meas); ui_plot_update("neg_away", xs_neg_away[:], ys_neg_away[:])
+                else:
+                    xs_neg_tow.append(i_meas); ys_neg_tow.append(v_meas); ui_plot_update("neg_towards", xs_neg_tow[:], ys_neg_tow[:])
+
+        def _run_sequence(currents_A, sign, branch, phase, direction, stop_check):
+            for idx in range(0, len(currents_A), batch_size):
+                if stop_event.is_set() or not ui_alive():
+                    return False, True
+                if not _guard_T():
+                    ui_set_status(f"{dev_name}: ΔT exceeded. Stopping.")
+                    return False, True
+                chunk = currents_A[idx:idx + batch_size]
+                signed = [sign * x for x in chunk]
+                readings = _run_iv_sweep_internal(
+                    dev, signed, settle_s,
+                    limit_v=params["vlimit"], outoff=False, nplc=params["nplc"]
+                )
+                for set_i, (i_meas, v_meas) in zip(signed, readings):
+                    if stop_event.is_set() or not ui_alive():
+                        return False, True
+                    if not np.isfinite(i_meas):
+                        i_meas = set_i
+                    if not np.isfinite(v_meas):
+                        v_meas = float("nan")
+                    _append_point(i_meas, v_meas, branch, phase, direction)
+                    if stop_check(v_meas, i_meas):
+                        return True, False
+            return False, False
+
+        # + branch up (find Ic+): away from 0
+        seq_up = _soft_ramp_sequence(I0, Imax, grow=grow, min_step_uA=min_step)
+        reached, aborted = _run_sequence(
+            seq_up, +1, '+', 'ramp_up', 'away',
+            lambda v, i: (np.isfinite(v) and abs(v) >= Vth)
+        )
+        if reached and not aborted:
+            for i_val, v_val in zip(xs_pos_away[::-1], ys_pos_away[::-1]):
+                if np.isfinite(v_val) and abs(v_val) >= Vth:
+                    markers["Ic_plus"] = i_val
+                    ui_annotate_x(i_val, "Ic_plus", "#cc0000")
+                    break
 
         # + branch down (find Ir+): towards 0
         if markers["Ic_plus"] is not None and not stop_event.is_set() and ui_alive():
-            for I in reversed(_soft_ramp_sequence(I0, abs(markers["Ic_plus"])*1e6, grow=grow, min_step_uA=min_step)):
-                if stop_event.is_set() or not ui_alive(): break
-                if not _guard_T(): break
-                _apply_I(dev, +I)
-                if settle_s > 0: time.sleep(settle_s)
-                i, v = _meas_iv(dev)
-                ts, Tk = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'), _tempK()
-                results_search.append((ts, f"{Tk:.6f}", f"{i:.12e}", f"{v:.12e}", '+', 'ramp_down', 'towards'))
-                xs_pos_tow.append(i); ys_pos_tow.append(v); ui_plot_update("pos_towards", xs_pos_tow[:], ys_pos_tow[:])
-                if abs(v) <= Vrt:
-                    markers["Ir_plus"] = i
-                    ui_annotate_x(i, "Ir_plus", "#008000")
-                    break
+            seq_down = list(reversed(_soft_ramp_sequence(I0, abs(markers["Ic_plus"])*1e6, grow=grow, min_step_uA=min_step)))
+            reached, aborted = _run_sequence(
+                seq_down, +1, '+', 'ramp_down', 'towards',
+                lambda v, i: (np.isfinite(v) and abs(v) <= Vrt)
+            )
+            if reached and not aborted:
+                for i_val, v_val in zip(xs_pos_tow[::-1], ys_pos_tow[::-1]):
+                    if np.isfinite(v_val) and abs(v_val) <= Vrt:
+                        markers["Ir_plus"] = i_val
+                        ui_annotate_x(i_val, "Ir_plus", "#008000")
+                        break
 
         # − branch up (find Ic−): away from 0
         if do_neg and not stop_event.is_set() and ui_alive():
-            for I in _soft_ramp_sequence(I0, Imax, grow=grow, min_step_uA=min_step):
-                if stop_event.is_set() or not ui_alive(): break
-                if not _guard_T(): break
-                _apply_I(dev, -I)
-                if settle_s > 0: time.sleep(settle_s)
-                i, v = _meas_iv(dev)
-                ts, Tk = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'), _tempK()
-                results_search.append((ts, f"{Tk:.6f}", f"{i:.12e}", f"{v:.12e}", '-', 'ramp_up', 'away'))
-                xs_neg_away.append(i); ys_neg_away.append(v); ui_plot_update("neg_away", xs_neg_away[:], ys_neg_away[:])
-                if abs(v) >= Vth:
-                    markers["Ic_minus"] = i
-                    ui_annotate_x(i, "Ic_minus", "#cc6600")
-                    break
+            seq_up_neg = _soft_ramp_sequence(I0, Imax, grow=grow, min_step_uA=min_step)
+            reached, aborted = _run_sequence(
+                seq_up_neg, -1, '-', 'ramp_up', 'away',
+                lambda v, i: (np.isfinite(v) and abs(v) >= Vth)
+            )
+            if reached and not aborted:
+                for i_val, v_val in zip(xs_neg_away[::-1], ys_neg_away[::-1]):
+                    if np.isfinite(v_val) and abs(v_val) >= Vth:
+                        markers["Ic_minus"] = i_val
+                        ui_annotate_x(i_val, "Ic_minus", "#cc6600")
+                        break
 
             # − branch down (find Ir−): towards 0
             if markers["Ic_minus"] is not None and not stop_event.is_set() and ui_alive():
-                for I in reversed(_soft_ramp_sequence(I0, abs(markers["Ic_minus"])*1e6, grow=grow, min_step_uA=min_step)):
-                    if stop_event.is_set() or not ui_alive(): break
-                    if not _guard_T(): break
-                    _apply_I(dev, -I)
-                    if settle_s > 0: time.sleep(settle_s)
-                    i, v = _meas_iv(dev)
-                    ts, Tk = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'), _tempK()
-                    results_search.append((ts, f"{Tk:.6f}", f"{i:.12e}", f"{v:.12e}", '-', 'ramp_down', 'towards'))
-                    xs_neg_tow.append(i); ys_neg_tow.append(v); ui_plot_update("neg_towards", xs_neg_tow[:], ys_neg_tow[:])
-                    if abs(v) <= Vrt:
-                        markers["Ir_minus"] = i
-                        ui_annotate_x(i, "Ir_minus", "#006699")
-                        break
+                seq_down_neg = list(reversed(_soft_ramp_sequence(I0, abs(markers["Ic_minus"])*1e6, grow=grow, min_step_uA=min_step)))
+                reached, aborted = _run_sequence(
+                    seq_down_neg, -1, '-', 'ramp_down', 'towards',
+                    lambda v, i: (np.isfinite(v) and abs(v) <= Vrt)
+                )
+                if reached and not aborted:
+                    for i_val, v_val in zip(xs_neg_tow[::-1], ys_neg_tow[::-1]):
+                        if np.isfinite(v_val) and abs(v_val) <= Vrt:
+                            markers["Ir_minus"] = i_val
+                            ui_annotate_x(i_val, "Ir_minus", "#006699")
+                            break
 
         # Save search (CSV + TXT)
         _dual_save_csv_and_txt(
@@ -5690,37 +6026,46 @@ def Find_JJ():
                 up   = _apply_jitter(base_up,   jitter_frac=jitter, keep_ends=True)
                 down = _apply_jitter(base_down, jitter_frac=jitter, keep_ends=True)
 
-                # Up sweep: away from 0
-                for Iabs in up:
-                    if stop_event.is_set() or not ui_alive(): break
-                    if not _guard_T(): break
-                    _apply_I(dev, sign * Iabs)
-                    if settle_s > 0: time.sleep(settle_s)
-                    i, v = _meas_iv(dev)
-                    ts, Tk = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'), _tempK()
-                    results_sweep.append((ts, f"{Tk:.6f}", f"{i:.12e}", f"{v:.12e}", label_sign, 'pretty_up', 'away', str(cyc)))
+                def _run_pretty(seq, phase, direction, xs_buf, ys_buf):
+                    for idx in range(0, len(seq), batch_size):
+                        if stop_event.is_set() or not ui_alive():
+                            return
+                        if not _guard_T():
+                            return
+                        chunk = seq[idx:idx + batch_size]
+                        signed = [sign * x for x in chunk]
+                        readings = _run_iv_sweep_internal(
+                            dev, signed, settle_s,
+                            limit_v=params["vlimit"], outoff=False, nplc=params["nplc"]
+                        )
+                        for set_i, (i_meas, v_meas) in zip(signed, readings):
+                            if stop_event.is_set() or not ui_alive():
+                                return
+                            if not np.isfinite(i_meas):
+                                i_meas = set_i
+                            if not np.isfinite(v_meas):
+                                v_meas = float("nan")
+                            ts, Tk = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'), _tempK()
+                            results_sweep.append((ts, f"{Tk:.6f}", f"{i_meas:.12e}", f"{v_meas:.12e}", label_sign, phase, direction, str(cyc)))
+                            xs_buf.append(i_meas); ys_buf.append(v_meas)
+                        if sign > 0:
+                            ui_plot_update("pos_away" if direction == 'away' else "pos_towards",
+                                           xs_buf[:], ys_buf[:])
+                        else:
+                            ui_plot_update("neg_away" if direction == 'away' else "neg_towards",
+                                           xs_buf[:], ys_buf[:])
 
-                    if sign > 0:
-                        xs_pos_away.append(i); ys_pos_away.append(v); ui_plot_update("pos_away", xs_pos_away[:], ys_pos_away[:])
-                    else:
-                        xs_neg_away.append(i); ys_neg_away.append(v); ui_plot_update("neg_away", xs_neg_away[:], ys_neg_away[:])
+                # Up sweep: away from 0
+                _run_pretty(up, "pretty_up", "away",
+                            xs_pos_away if sign > 0 else xs_neg_away,
+                            ys_pos_away if sign > 0 else ys_neg_away)
 
                 # Down sweep: towards 0
-                for Iabs in down:
-                    if stop_event.is_set() or not ui_alive(): break
-                    if not _guard_T(): break
-                    _apply_I(dev, sign * Iabs)
-                    if settle_s > 0: time.sleep(settle_s)
-                    i, v = _meas_iv(dev)
-                    ts, Tk = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'), _tempK()
-                    results_sweep.append((ts, f"{Tk:.6f}", f"{i:.12e}", f"{v:.12e}", label_sign, 'pretty_down', 'towards', str(cyc)))
+                _run_pretty(down, "pretty_down", "towards",
+                            xs_pos_tow if sign > 0 else xs_neg_tow,
+                            ys_pos_tow if sign > 0 else ys_neg_tow)
 
-                    if sign > 0:
-                        xs_pos_tow.append(i); ys_pos_tow.append(v); ui_plot_update("pos_towards", xs_pos_tow[:], ys_pos_tow[:])
-                    else:
-                        xs_neg_tow.append(i); ys_neg_tow.append(v); ui_plot_update("neg_towards", xs_neg_tow[:], ys_neg_tow[:])
-
-                # ensure return to exact zero between cycles (optional but matches your request)
+                # ensure return to exact zero between cycles
                 if stop_event.is_set() or not ui_alive(): break
                 _apply_I(dev, 0.0)
                 time.sleep(max(0.0, settle_s))
@@ -5774,6 +6119,7 @@ def Find_JJ():
                 pretty_over_factor  = float(e_over.get()),
                 pretty_cycles = max(1, int(float(e_cycles.get()))),
                 pretty_jitter_frac = max(0.0, float(e_jitter.get())),
+                batch_size = 200,
             )
 
             # ask filename on UI thread
