@@ -802,8 +802,13 @@ endscript
 runscript {name}
 """
 
-def _ensure_tsp_pulse_script_loaded(dev=k):
+def _ensure_tsp_pulse_script_loaded(dev=None):
     global _tsp_pulse_loaded_devices, _tsp_pulse_disabled
+    if dev is None:
+        if "k" not in globals() or globals()["k"] is None:
+            _warn_tsp_disabled("device not initialized")
+            return False
+        dev = globals()["k"]
     if _tsp_pulse_disabled:
         return False
     dev_key = id(dev)
