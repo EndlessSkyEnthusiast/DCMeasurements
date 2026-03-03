@@ -12,7 +12,7 @@ import os
 import matplotlib
 import time
 import tkinter as tk
-from tkinter import filedialog, simpledialog, ttk, messagebox
+from tkinter import filedialog, simpledialog, ttk, messagebox, colorchooser
 import json
 import matplotlib.pyplot as plt
 import threading
@@ -30,6 +30,7 @@ from controller_interfaces import ContinuousTemperatureControl, MagnetControl, A
 from Connection_Codes import ConnectKeithley, ConnectKiutra, ConnectKeithley_ASRL5_TSP
 import tkinter.font as tkFont
 from pymeasure.instruments.keithley import Keithley2600
+from matplotlib import colors as mcolors
 
 #%% Cell 2: Safe File
 #Safe or load File
@@ -5240,6 +5241,190 @@ def create_parallel_4pt_measurement_Sense():
     
 
 #%% Cell 11: Live Plotting
+def attach_interactive_plot_controls(plot_window, fig, ax, canvas, default_legend_title='Samples'):
+    """Adds interactive controls for legend/axis text, colors and font size."""
+    state = {"selected": None}
+
+    def ensure_legend():
+        handles, labels = ax.get_legend_handles_labels()
+        if not handles:
+            return None
+        legend = ax.get_legend()
+        title = legend.get_title().get_text() if legend else (default_legend_title or "")
+        if title == "":
+            title = default_legend_title
+        return ax.legend(loc='upper right', title=title)
+
+    def redraw():
+        ensure_legend()
+        fig.canvas.draw_idle()
+
+    def line_name(line, idx):
+        label = line.get_label()
+        if not label or label.startswith('_'):
+            return f"Sample {idx + 1}"
+        return label
+
+    def set_selected_line(line):
+        state["selected"] = line
+        selected_var.set(line_name(line, series_lines.index(line)))
+        series_name_var.set(line_name(line, series_lines.index(line)))
+
+    def refresh_series_options():
+        nonlocal series_lines
+        series_lines = [line for line in ax.get_lines()]
+        names = [line_name(line, idx) for idx, line in enumerate(series_lines)]
+        if not names:
+            names = ["-"]
+            state["selected"] = None
+        series_menu["values"] = names
+        if state["selected"] in series_lines:
+            set_selected_line(state["selected"])
+        elif series_lines:
+            set_selected_line(series_lines[0])
+        else:
+            selected_var.set(names[0])
+            series_name_var.set("")
+
+    def pick_color_for_selected():
+        line = state.get("selected")
+        if line is None:
+            return
+        current = mcolors.to_hex(line.get_color()) if line.get_color() else '#1f77b4'
+        rgb, hex_color = colorchooser.askcolor(color=current, title="Pick sample color")
+        if hex_color:
+            line.set_color(hex_color)
+            redraw()
+
+    def apply_series_changes():
+        line = state.get("selected")
+        if line is None:
+            return
+        new_name = series_name_var.get().strip()
+        if new_name:
+            line.set_label(new_name)
+        refresh_series_options()
+        redraw()
+
+    def apply_axis_text_and_size():
+        ax.set_xlabel(xlabel_var.get())
+        ax.set_ylabel(ylabel_var.get())
+        ax.set_title(title_var.get())
+        legend = ax.get_legend()
+        legend_title = legend_title_var.get().strip()
+        if legend:
+            legend.set_title(legend_title)
+        try:
+            fs = float(fontsize_var.get())
+            ax.xaxis.label.set_size(fs)
+            ax.yaxis.label.set_size(fs)
+            ax.title.set_size(fs)
+            for t in ax.get_xticklabels() + ax.get_yticklabels():
+                t.set_fontsize(max(6, fs - 1))
+            lg = ax.get_legend()
+            if lg:
+                lg.get_title().set_fontsize(fs)
+                for txt in lg.get_texts():
+                    txt.set_fontsize(max(6, fs - 1))
+        except ValueError:
+            pass
+        redraw()
+
+    def on_series_selected(_event=None):
+        choice = selected_var.get()
+        for idx, line in enumerate(series_lines):
+            if line_name(line, idx) == choice:
+                set_selected_line(line)
+                break
+
+    def on_plot_double_click(event):
+        if not event.dblclick:
+            return
+        legend = ax.get_legend()
+        if legend is None or event.x is None or event.y is None:
+            return
+        if not legend.get_window_extent().contains(event.x, event.y):
+            return
+
+        for txt in legend.get_texts():
+            if txt.get_window_extent().contains(event.x, event.y):
+                old = txt.get_text()
+                new = simpledialog.askstring("Rename Sample", "Neuer Name für Probe:", initialvalue=old, parent=plot_window)
+                if new:
+                    txt.set_text(new)
+                    for line in series_lines:
+                        if line.get_label() == old:
+                            line.set_label(new)
+                            set_selected_line(line)
+                            break
+                    refresh_series_options()
+                    redraw()
+                return
+
+        if legend.get_title().get_window_extent().contains(event.x, event.y):
+            new_title = simpledialog.askstring("Legend title", "Text statt 'Samples':", initialvalue=legend.get_title().get_text(), parent=plot_window)
+            if new_title is not None:
+                legend_title_var.set(new_title)
+                legend.set_title(new_title)
+                redraw()
+
+    def on_plot_single_click(event):
+        legend = ax.get_legend()
+        if legend is None or event.dblclick or event.x is None or event.y is None:
+            return
+        if not legend.get_window_extent().contains(event.x, event.y):
+            return
+        for txt in legend.get_texts():
+            if txt.get_window_extent().contains(event.x, event.y):
+                old = txt.get_text()
+                for line in series_lines:
+                    if line.get_label() == old:
+                        set_selected_line(line)
+                        pick_color_for_selected()
+                        return
+
+    panel = ttk.LabelFrame(plot_window, text="Plot Editor")
+    panel.pack(fill='x', padx=6, pady=(0, 6))
+
+    selected_var = tk.StringVar(value="")
+    series_name_var = tk.StringVar(value="")
+    legend_title_var = tk.StringVar(value=default_legend_title)
+    xlabel_var = tk.StringVar(value=ax.get_xlabel())
+    ylabel_var = tk.StringVar(value=ax.get_ylabel())
+    title_var = tk.StringVar(value=ax.get_title())
+    fontsize_var = tk.StringVar(value="10")
+
+    ttk.Label(panel, text="Series").grid(row=0, column=0, padx=4, pady=2, sticky='e')
+    series_menu = ttk.Combobox(panel, state='readonly', textvariable=selected_var, width=24)
+    series_menu.grid(row=0, column=1, padx=4, pady=2, sticky='w')
+    series_menu.bind("<<ComboboxSelected>>", on_series_selected)
+
+    ttk.Label(panel, text="Name").grid(row=0, column=2, padx=4, pady=2, sticky='e')
+    ttk.Entry(panel, textvariable=series_name_var, width=24).grid(row=0, column=3, padx=4, pady=2, sticky='w')
+    ttk.Button(panel, text="Apply sample", command=apply_series_changes).grid(row=0, column=4, padx=4, pady=2)
+    ttk.Button(panel, text="Color", command=pick_color_for_selected).grid(row=0, column=5, padx=4, pady=2)
+
+    ttk.Label(panel, text="Legend title").grid(row=1, column=0, padx=4, pady=2, sticky='e')
+    ttk.Entry(panel, textvariable=legend_title_var, width=24).grid(row=1, column=1, padx=4, pady=2, sticky='w')
+    ttk.Label(panel, text="X axis").grid(row=1, column=2, padx=4, pady=2, sticky='e')
+    ttk.Entry(panel, textvariable=xlabel_var, width=24).grid(row=1, column=3, padx=4, pady=2, sticky='w')
+
+    ttk.Label(panel, text="Y axis").grid(row=2, column=0, padx=4, pady=2, sticky='e')
+    ttk.Entry(panel, textvariable=ylabel_var, width=24).grid(row=2, column=1, padx=4, pady=2, sticky='w')
+    ttk.Label(panel, text="Title").grid(row=2, column=2, padx=4, pady=2, sticky='e')
+    ttk.Entry(panel, textvariable=title_var, width=24).grid(row=2, column=3, padx=4, pady=2, sticky='w')
+
+    ttk.Label(panel, text="Font size").grid(row=3, column=0, padx=4, pady=2, sticky='e')
+    ttk.Entry(panel, textvariable=fontsize_var, width=8).grid(row=3, column=1, padx=4, pady=2, sticky='w')
+    ttk.Button(panel, text="Apply axis/legend", command=apply_axis_text_and_size).grid(row=3, column=3, padx=4, pady=2, sticky='w')
+
+    series_lines = []
+    refresh_series_options()
+    ensure_legend()
+    canvas.mpl_connect('button_press_event', on_plot_single_click)
+    canvas.mpl_connect('button_press_event', on_plot_double_click)
+
+
 def create_plot_window_for_Resistance(Name):
     # Create a new window for the plot
     plot_window = tk.Toplevel(root)
@@ -5251,11 +5436,12 @@ def create_plot_window_for_Resistance(Name):
     ax.set_xlabel('Temperature (K)')
     ax.set_ylabel('Resistance (Ohms)')
     ax.set_title('ResistancePlot')
-    ax.legend(loc='upper right')
+    ax.legend(loc='upper right', title='Samples')
 
     # Embed the plot in the Tkinter window
     canvas = FigureCanvasTkAgg(fig, master=plot_window)
     canvas.get_tk_widget().pack()
+    attach_interactive_plot_controls(plot_window, fig, ax, canvas, default_legend_title='Samples')
     
     return plot_window, fig, ax, line
 def create_plot_window_for_Current_Voltage(Name):
@@ -5269,11 +5455,12 @@ def create_plot_window_for_Current_Voltage(Name):
     ax.set_xlabel('Voltage(V)')
     ax.set_ylabel('Current(A)')
     ax.set_title('IV Plot')
-    ax.legend(loc='upper right')
+    ax.legend(loc='upper right', title='Samples')
 
     # Embed the plot in the Tkinter window
     canvas = FigureCanvasTkAgg(fig, master=plot_window)
     canvas.get_tk_widget().pack()
+    attach_interactive_plot_controls(plot_window, fig, ax, canvas, default_legend_title='Samples')
     
     return plot_window, fig, ax, line
 
@@ -5288,11 +5475,12 @@ def create_plot_window_for_Voltage_Current(Name):
     ax.set_xlabel('Current(A)')
     ax.set_ylabel('Voltage(V)')
     ax.set_title('IV Plot')
-    ax.legend(loc='upper right')
+    ax.legend(loc='upper right', title='Samples')
 
     # Embed the plot in the Tkinter window
     canvas = FigureCanvasTkAgg(fig, master=plot_window)
     canvas.get_tk_widget().pack()
+    attach_interactive_plot_controls(plot_window, fig, ax, canvas, default_legend_title='Samples')
     
     return plot_window, fig, ax, line
 def create_plot_window_for_Temperature():
@@ -5306,11 +5494,12 @@ def create_plot_window_for_Temperature():
     ax.set_xlabel('Time[s]')
     ax.set_ylabel('Temperature[K]')
     ax.set_title('Temperature')
-    ax.legend(loc='upper right')
+    ax.legend(loc='upper right', title='Samples')
 
     # Embed the plot in the Tkinter window
     canvas = FigureCanvasTkAgg(fig, master=plot_window)
     canvas.get_tk_widget().pack()
+    attach_interactive_plot_controls(plot_window, fig, ax, canvas, default_legend_title='Samples')
     
     return plot_window, fig, ax, line
 #%% Cell 12: IV Current Curve4PT
