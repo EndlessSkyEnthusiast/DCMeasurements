@@ -5238,6 +5238,334 @@ def Find_JJ():
     return win
 
 
+def Find_JJ_at_Several_Temperatures():
+    """Find JJ/IV sweeps over a generated temperature range."""
+    def _tempK():
+        try:
+            return float(client.query('T_sample.kelvin') or 300.0)
+        except Exception:
+            return 300.0
+
+    def _dated(base):
+        return f"{base}_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}"
+
+    def _conf_smu(dev, nplc, vlimit_V):
+        try: dev.smua.sense = dev.smua.SENSE_REMOTE
+        except Exception: pass
+        try: dev.smua.measure.nplc = float(nplc)
+        except Exception: pass
+        try:
+            dev.smua.source.output = 1
+            dev.smua.source.func = 2
+            dev.smua.source.limitv = float(vlimit_V)
+        except Exception:
+            pass
+
+    def _apply_I(dev, I_A):
+        try:
+            k.apply_current(dev.smua, float(I_A))
+        except Exception:
+            try: dev.smua.source.leveli = float(I_A)
+            except Exception: pass
+
+    def _meas_iv(dev):
+        try:
+            i, v = dev.smua.measure.iv()
+            return float(i), float(v)
+        except Exception:
+            try:
+                return float(dev.smua.measure.i()), float(dev.smua.measure.v())
+            except Exception:
+                return float('nan'), float('nan')
+
+    def _output_off(dev):
+        try: dev.smua.source.output = 0
+        except Exception: pass
+
+    def _dual_save_csv_and_txt(base, suffix, header_cols, rows):
+        csv_name = f"{base}{suffix}.csv"
+        txt_name = f"{base}{suffix}.txt"
+        arr = np.asarray(rows, dtype=object) if rows else np.empty((0, len(header_cols)), dtype=object)
+        p1 = SAVE_PATH if 'SAVE_PATH' in globals() else os.getcwd()
+        p2 = SAVE_PATH_2 if 'SAVE_PATH_2' in globals() else None
+        for p in (p1, p2):
+            if not p:
+                continue
+            try:
+                os.makedirs(p, exist_ok=True)
+                np.savetxt(os.path.join(p, csv_name), arr, fmt="%s", delimiter=",", header=",".join(header_cols), comments="")
+                np.savetxt(os.path.join(p, txt_name), arr, fmt="%s", delimiter="\t", header="\t".join(header_cols), comments="")
+            except Exception:
+                pass
+
+    def _temp_points(start_k, end_k, steps):
+        steps = max(1, int(steps))
+        if steps == 1:
+            return [float(start_k)]
+        return list(np.linspace(float(start_k), float(end_k), steps))
+
+    def _wait_for_target_temperature(target_k, ramp_k_min, tol_k, reload_timer_s, status_cb, stop_event):
+        if target_k < 0.3:
+            try:
+                if getattr(temperature_control, "is_active", False):
+                    temperature_control.stop()
+                    time.sleep(0.5)
+            except Exception:
+                pass
+            try:
+                adr_control.start_adr(
+                    setpoint=float(target_k), ramp=float(ramp_k_min),
+                    adr_mode=None, operation_mode='cadr',
+                    auto_regenerate=True, pre_regenerate=True
+                )
+            except Exception:
+                pass
+        else:
+            try:
+                temperature_control.start((float(target_k), float(ramp_k_min)))
+            except Exception:
+                pass
+
+        t0 = time.time()
+        last_reload = t0
+        while not stop_event.is_set():
+            now = time.time()
+            Tk = _tempK()
+            if abs(Tk - target_k) <= tol_k:
+                return Tk
+
+            if reload_timer_s > 0 and (now - last_reload) >= reload_timer_s:
+                try:
+                    adr_control.start_adr(
+                        setpoint=float(target_k), ramp=float(ramp_k_min),
+                        adr_mode=None, operation_mode='cadr',
+                        auto_regenerate=True, pre_regenerate=True
+                    )
+                    status_cb(f"Temp {target_k:.3f} K not reached -> Magnet reload/ADR triggered.")
+                except Exception as ex:
+                    status_cb(f"Reload timer event failed: {ex}")
+                last_reload = now
+
+            elapsed = now - t0
+            status_cb(f"Driving T -> {target_k:.3f} K | now {Tk:.3f} K | elapsed {elapsed:.0f}s")
+            time.sleep(0.25)
+        return None
+
+    win = tk.Toplevel(root)
+    win.title("Find JJ at several temperatures")
+    win.geometry("+180+120")
+
+    stop_event = threading.Event()
+    ui_closed = {'flag': False}
+    section_frames = []
+
+    def ui_alive():
+        return (not ui_closed['flag']) and bool(win.winfo_exists())
+
+    def on_close():
+        ui_closed['flag'] = True
+        stop_event.set()
+        try: win.destroy()
+        except Exception: pass
+
+    win.protocol("WM_DELETE_WINDOW", on_close)
+
+    opts = ttk.LabelFrame(win, text="General")
+    opts.grid(row=0, column=0, sticky="ew", padx=10, pady=6)
+
+    use1 = tk.IntVar(value=1)
+    use2 = tk.IntVar(value=0)
+    tk.Checkbutton(opts, text="Use SMU1", variable=use1).grid(row=0, column=0, sticky="w")
+    tk.Checkbutton(opts, text="Use SMU2", variable=use2).grid(row=0, column=1, sticky="w")
+
+    ttk.Label(opts, text="NPLC").grid(row=1, column=0, sticky="e")
+    e_nplc = ttk.Entry(opts, width=10); e_nplc.insert(0, "0.2"); e_nplc.grid(row=1, column=1, sticky="w")
+    ttk.Label(opts, text="V-limit (V)").grid(row=1, column=2, sticky="e")
+    e_vlim = ttk.Entry(opts, width=10); e_vlim.insert(0, "0.02"); e_vlim.grid(row=1, column=3, sticky="w")
+    ttk.Label(opts, text="Settle per point (ms)").grid(row=1, column=4, sticky="e")
+    e_settle = ttk.Entry(opts, width=10); e_settle.insert(0, "2.0"); e_settle.grid(row=1, column=5, sticky="w")
+
+    tempf = ttk.LabelFrame(win, text="Temperature sweep")
+    tempf.grid(row=1, column=0, sticky="ew", padx=10, pady=6)
+    ttk.Label(tempf, text="Start T (K)").grid(row=0, column=0, sticky="e")
+    e_tstart = ttk.Entry(tempf, width=10); e_tstart.insert(0, "1.0"); e_tstart.grid(row=0, column=1, sticky="w")
+    ttk.Label(tempf, text="End T (K)").grid(row=0, column=2, sticky="e")
+    e_tend = ttk.Entry(tempf, width=10); e_tend.insert(0, "4.0"); e_tend.grid(row=0, column=3, sticky="w")
+    ttk.Label(tempf, text="T steps").grid(row=0, column=4, sticky="e")
+    e_tsteps = ttk.Entry(tempf, width=10); e_tsteps.insert(0, "7"); e_tsteps.grid(row=0, column=5, sticky="w")
+    ttk.Label(tempf, text="Ramp (K/min)").grid(row=1, column=0, sticky="e")
+    e_tramp = ttk.Entry(tempf, width=10); e_tramp.insert(0, "1.0"); e_tramp.grid(row=1, column=1, sticky="w")
+    ttk.Label(tempf, text="Tolerance (K)").grid(row=1, column=2, sticky="e")
+    e_ttol = ttk.Entry(tempf, width=10); e_ttol.insert(0, "0.05"); e_ttol.grid(row=1, column=3, sticky="w")
+    ttk.Label(tempf, text="Settle after T (s)").grid(row=1, column=4, sticky="e")
+    e_tsettle = ttk.Entry(tempf, width=10); e_tsettle.insert(0, "5"); e_tsettle.grid(row=1, column=5, sticky="w")
+    ttk.Label(tempf, text="Reload timer (min)").grid(row=2, column=0, sticky="e")
+    e_reload = ttk.Entry(tempf, width=10); e_reload.insert(0, "20"); e_reload.grid(row=2, column=1, sticky="w")
+
+    sweepf = ttk.LabelFrame(win, text="Current sweep sections (µA)")
+    sweepf.grid(row=2, column=0, sticky="ew", padx=10, pady=6)
+
+    def _add_section(start="0", end="50", steps="101"):
+        row = tk.Frame(sweepf)
+        tk.Label(row, text="Start µA").grid(row=0, column=0)
+        e0 = tk.Entry(row, width=8); e0.insert(0, str(start)); e0.grid(row=0, column=1)
+        tk.Label(row, text="End µA").grid(row=0, column=2)
+        e1 = tk.Entry(row, width=8); e1.insert(0, str(end)); e1.grid(row=0, column=3)
+        tk.Label(row, text="Steps").grid(row=0, column=4)
+        e2 = tk.Entry(row, width=8); e2.insert(0, str(steps)); e2.grid(row=0, column=5)
+        tk.Button(row, text="Remove", command=row.destroy).grid(row=0, column=6, padx=4)
+        row.pack(fill=tk.X, pady=2)
+        section_frames.append(row)
+
+    _add_section()
+
+    cyclesf = ttk.Frame(win)
+    cyclesf.grid(row=3, column=0, sticky="ew", padx=10, pady=4)
+    ttk.Label(cyclesf, text="Cycles per temperature").pack(side=tk.LEFT)
+    e_cycles = ttk.Entry(cyclesf, width=10); e_cycles.insert(0, "1"); e_cycles.pack(side=tk.LEFT, padx=6)
+    ttk.Button(cyclesf, text="Add section", command=_add_section).pack(side=tk.LEFT, padx=8)
+
+    btnf = ttk.Frame(win)
+    btnf.grid(row=4, column=0, sticky="ew", padx=10, pady=4)
+    start_btn = ttk.Button(btnf, text="Start")
+    stop_btn = ttk.Button(btnf, text="Stop", state=tk.DISABLED)
+    start_btn.pack(side=tk.RIGHT, padx=4); stop_btn.pack(side=tk.RIGHT, padx=4)
+
+    status = ttk.Label(win, text="Ready.")
+    status.grid(row=5, column=0, sticky="w", padx=10, pady=(0, 8))
+
+    fig = Figure(figsize=(7.2, 4.8), dpi=100)
+    ax = fig.add_subplot(111)
+    ax.set_title("IV curves color-coded by temperature")
+    ax.set_xlabel("I (A)")
+    ax.set_ylabel("V (V)")
+    canvas = FigureCanvasTkAgg(fig, master=win)
+    canvas.draw()
+    canvas.get_tk_widget().grid(row=6, column=0, sticky="nsew", padx=10, pady=6)
+    win.grid_rowconfigure(6, weight=1); win.grid_columnconfigure(0, weight=1)
+
+    def ui_status(msg):
+        if ui_alive():
+            win.after(0, lambda: status.config(text=msg))
+
+    def ui_buttons(start_on, stop_on):
+        if ui_alive():
+            win.after(0, lambda: (start_btn.config(state=(tk.NORMAL if start_on else tk.DISABLED)),
+                                  stop_btn.config(state=(tk.NORMAL if stop_on else tk.DISABLED))))
+
+    def _worker():
+        try:
+            ui_buttons(False, True)
+            use_smua, use_smub = bool(use1.get()), bool(use2.get())
+            if not (use_smua or use_smub):
+                ui_status("No SMU selected.")
+                return
+
+            t_start = float(e_tstart.get()); t_end = float(e_tend.get()); t_steps = int(e_tsteps.get())
+            ramp_k_min = float(e_tramp.get()); t_tol = float(e_ttol.get())
+            settle_after_t_s = max(0.0, float(e_tsettle.get()))
+            reload_timer_s = max(0.0, float(e_reload.get()) * 60.0)
+            nplc = float(e_nplc.get()); vlimit = float(e_vlim.get())
+            point_settle_s = max(0.0, float(e_settle.get()) * 1e-3)
+            cycles = max(1, int(float(e_cycles.get())))
+
+            sections = []
+            for fr in section_frames:
+                if not fr.winfo_exists():
+                    continue
+                w = fr.winfo_children()
+                start_uA = float(w[1].get()); end_uA = float(w[3].get()); steps = int(float(w[5].get()))
+                steps = max(2, steps)
+                sections.append((start_uA, end_uA, steps))
+            if not sections:
+                ui_status("No valid current sweep section.")
+                return
+
+            base = simpledialog.askstring("Save name", "Enter base filename (no extension):", parent=win)
+            if not base:
+                ui_status("No filename given.")
+                return
+            base = _dated(base)
+
+            temps = _temp_points(t_start, t_end, t_steps)
+            cmap = plt.get_cmap("viridis")
+            color_vals = np.linspace(0.1, 0.95, max(2, len(temps)))
+
+            devices = []
+            if use_smua: devices.append(("SMU1", k, "-"))
+            if use_smub: devices.append(("SMU2", k2, "--"))
+            for _, dev, _ in devices:
+                _conf_smu(dev, nplc=nplc, vlimit_V=vlimit)
+
+            ax.cla()
+            ax.set_title(f"Find JJ at several temperatures — {base}")
+            ax.set_xlabel("I (A)"); ax.set_ylabel("V (V)")
+
+            for t_idx, target_t in enumerate(temps):
+                if stop_event.is_set() or not ui_alive():
+                    break
+                ui_status(f"Set temperature {target_t:.3f} K ({t_idx+1}/{len(temps)})")
+                reached_t = _wait_for_target_temperature(target_t, ramp_k_min, t_tol, reload_timer_s, ui_status, stop_event)
+                if reached_t is None:
+                    break
+                if settle_after_t_s > 0:
+                    time.sleep(settle_after_t_s)
+
+                this_temp_rows = []
+                color = cmap(color_vals[t_idx])
+
+                for cyc in range(1, cycles + 1):
+                    for sec_idx, (i0_uA, i1_uA, nsteps) in enumerate(sections, start=1):
+                        setpoints_A = np.linspace(i0_uA * 1e-6, i1_uA * 1e-6, nsteps)
+                        for sp_A in setpoints_A:
+                            if stop_event.is_set() or not ui_alive():
+                                break
+                            for dev_name, dev, style in devices:
+                                _apply_I(dev, sp_A)
+                                if point_settle_s > 0:
+                                    time.sleep(point_settle_s)
+                                im, vm = _meas_iv(dev)
+                                ts = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                                Tk = _tempK()
+                                this_temp_rows.append((ts, f"{Tk:.6f}", dev_name, str(cyc), str(sec_idx),
+                                                       f"{sp_A:.12e}", f"{im:.12e}", f"{vm:.12e}"))
+                                ax.plot(im, vm, marker='.', linestyle='None', color=color, alpha=0.85)
+                            if ui_alive():
+                                win.after(0, canvas.draw_idle)
+
+                temp_tag = f"{reached_t:.3f}".replace(".", "p")
+                _dual_save_csv_and_txt(
+                    base, f"_T{temp_tag}K_JJtemp",
+                    ("timestamp", "T_K", "device", "cycle", "section", "I_set_A", "I_meas_A", "V_meas_V"),
+                    this_temp_rows
+                )
+                for dev_name, _, style in devices:
+                    ax.plot([], [], linestyle=style, color=color, label=f"{dev_name} @ {reached_t:.3f} K")
+                if len(temps) <= 14:
+                    ax.legend(loc="best", fontsize=8)
+                if ui_alive():
+                    win.after(0, canvas.draw_idle)
+                ui_status(f"Saved temperature point {reached_t:.3f} K")
+
+            ui_status("Done.")
+        except Exception as ex:
+            if ui_alive():
+                win.after(0, lambda: messagebox.showerror("Find JJ T-sweep", f"Error: {ex}"))
+        finally:
+            for dev in (k, k2):
+                _apply_I(dev, 0.0)
+                _output_off(dev)
+            ui_buttons(True, False)
+
+    def _stop():
+        stop_event.set()
+        ui_status("Stopping…")
+
+    start_btn.config(command=lambda: threading.Thread(target=_worker, daemon=True).start())
+    stop_btn.config(command=_stop)
+    return win
+
+
 
 #%% NEW IV MODE — unified UI (Current µA / Voltage mV), fast & cyclic, threaded, scatter plot
 
@@ -5744,6 +6072,15 @@ add_button_with_details_and_load(
     "Soft Ic finder with retrapping (optional). Uses SMU1/SMU2 selectable.\n"
     "Starts from tiny currents and grows smoothly. Stops if ΔT exceeds 0.1 K.\n"
     "Saves CSV with timestamp and temperature.",
+    load_cb := (lambda: None)
+)
+add_button_with_details_and_load(
+    iv_frame,
+    "Find JJ at several temperatures",
+    Find_JJ_at_Several_Temperatures,
+    "Find-JJ style current sweep over an automatically generated temperature range.\n"
+    "Set T start/end/steps, ramp, cycles, and µA sweep sections via Add Section.\n"
+    "Runs full cycles per temperature, saves one file per temperature, and plots IV curves color-coded by T.",
     load_cb := (lambda: None)
 )
 
