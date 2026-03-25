@@ -3058,6 +3058,13 @@ def create_temp_frame(parent):
 def IV_Temp():
     global measurement 
     measurement = 1
+    TEMP_TOLERANCE_K = 0.01
+    MIN_TEMP_K = 0.08
+    MAX_TEMP_K = 290
+    ADR_SWITCH_TEMP_K = 3.0
+    ADR_FIRST_TIMEOUT_S = 30 * 60      # only for datapoint index >= 1
+    ADR_SECOND_TIMEOUT_S = 60 * 60     # after reset, skip point if still not reached
+
     def add_iv_section():
         frame = create_section_frame(iv_sections_frame)
         frame.grid(row=len(iv_section_frames), column=0, padx=10, pady=10)
@@ -3077,6 +3084,108 @@ def IV_Temp():
     current_temp_row = 0
     current_temp_col = 0
 
+    def _query_sample_temperature():
+        try:
+            return float(client.query('T_sample.kelvin') or 300)
+        except Exception:
+            return 300.0
+
+    def _start_temperature_drive(target_k, ramp_k_min):
+        if target_k < ADR_SWITCH_TEMP_K:
+            try:
+                if getattr(temperature_control, "is_active", False):
+                    temperature_control.stop()
+                    time.sleep(0.5)
+            except Exception:
+                pass
+            adr_control.start_adr(
+                setpoint=float(target_k), ramp=float(ramp_k_min),
+                adr_mode=None, operation_mode='cadr',
+                auto_regenerate=True, pre_regenerate=False
+            )
+        else:
+            temperature_control.start((float(target_k), float(ramp_k_min)))
+
+    def _wait_until_target(target_k, ramp_k_min, point_index):
+        current_temp = _query_sample_temperature()
+        if abs(current_temp - target_k) <= TEMP_TOLERANCE_K:
+            print(f"Temperature already at target ({current_temp:.3f} K), skipping control start.")
+            return True
+
+        _start_temperature_drive(target_k, ramp_k_min)
+
+        # >=3 K or first point: wait as long as needed
+        if target_k >= ADR_SWITCH_TEMP_K or point_index == 0:
+            while abs(_query_sample_temperature() - target_k) > TEMP_TOLERANCE_K:
+                time.sleep(0.2)
+            return True
+
+        # <3 K and datapoint index >=1:
+        # 1) wait 30 min, then one reset + pre-regenerate
+        phase_start = time.time()
+        reset_done = False
+        reset_time = None
+
+        while True:
+            if abs(_query_sample_temperature() - target_k) <= TEMP_TOLERANCE_K:
+                return True
+
+            elapsed = time.time() - phase_start
+            if (not reset_done) and elapsed >= ADR_FIRST_TIMEOUT_S:
+                print(f"Target {target_k:.3f} K not reached after 30 min -> ADR reset + pre-regenerate.")
+                try:
+                    adr_control.start_adr(
+                        setpoint=float(target_k), ramp=float(ramp_k_min),
+                        adr_mode=None, operation_mode='cadr',
+                        auto_regenerate=True, pre_regenerate=True
+                    )
+                except Exception as ex:
+                    print(f"ADR reset failed: {ex}")
+                reset_done = True
+                reset_time = time.time()
+
+            if reset_done and (time.time() - reset_time) >= ADR_SECOND_TIMEOUT_S:
+                print(f"Target {target_k:.3f} K still not reached 1 hour after reset. Skipping datapoint.")
+                return False
+
+            time.sleep(0.2)
+
+    def run_worker(sweep_data, temperature_data, user_input):
+        try:
+            for point_index, (start_temp, ramp_speed) in enumerate(temperature_data):
+                reached_target = _wait_until_target(start_temp, ramp_speed, point_index)
+                if not reached_target:
+                    continue
+
+                time.sleep(60)
+                # Perform the IV sweep using the run_sweep() function
+                # It's assumed that run_sweep() will use the current temperature in its measurements
+                temperature_str = str(_query_sample_temperature())
+                user_input_temperature = user_input + "_" + temperature_str + "K" + "_"
+                run_sweep(sweep_data,user_input_temperature)
+        finally:
+            try:
+                temperature_control.stop()
+            except Exception:
+                pass
+
+            def _finish_ui():
+                try:
+                    iv_temp_window.destroy()
+                except Exception:
+                    pass
+                try:
+                    k.smua.source.output = 0
+                except Exception:
+                    pass
+                try:
+                    k2.smua.source.output = 0
+                except Exception:
+                    pass
+                global measurement
+                measurement = 0
+
+            root.after(0, _finish_ui)
 
     def run():
         # Collect IV sweep data (start, end, steps) from the GUI
@@ -3104,14 +3213,14 @@ def IV_Temp():
             try:
                 start_temp_value = frame.winfo_children()[1].get()
                 start_temp_value = float(start_temp_value)
-                if 0.2 < start_temp_value <290:
+                if MIN_TEMP_K < start_temp_value < MAX_TEMP_K:
                     None
                 else:
-                    Errormessage("Out of Value Range 0.2-290K")
-                    if start_temp_value >290:
-                        start_temp_value = 290
+                    Errormessage("Out of Value Range 0.08-290K")
+                    if start_temp_value > MAX_TEMP_K:
+                        start_temp_value = MAX_TEMP_K
                     else:
-                        start_temp_value = 0.2
+                        start_temp_value = MIN_TEMP_K
                 ramp_speed_value = frame.winfo_children()[3].get()
                 start_temp = float(start_temp_value)
                 ramp_speed = float(ramp_speed_value)
@@ -3124,27 +3233,15 @@ def IV_Temp():
                  if "bad window path name" not in str(e):
                      raise e
         user_input = simpledialog.askstring("Insert Filename", "Please insert the file Name:")
-
-        for start_temp, ramp_speed in temperature_data:
-            # Set the temperature using your temperature control mechanism
-            temperature_control.start((start_temp, ramp_speed))
-            # Wait until the target start temperature is reached within 0.01K certainty
-            while abs(client.query('T_sample.kelvin') - start_temp) > 0.01:
-                time.sleep(0.2)  # Wait for 0.2 seconds
-                
-            time.sleep(60)
-            # Perform the IV sweep using the run_sweep() function
-            # It's assumed that run_sweep() will use the current temperature in its measurements
-            temperature_str = str(client.query('T_sample.kelvin') or 300)
-            user_input_temperature = user_input + "_" + temperature_str + "K" + "_"
-            run_sweep(sweep_data,user_input_temperature)
-        temperature_control.stop()
-            
-        iv_temp_window.destroy()
-        k.smua.source.output = 0
-        k2.smua.source.output = 0
-        global measurement 
-        measurement = 0
+        if user_input is None:
+            global measurement
+            measurement = 0
+            return
+        threading.Thread(
+            target=run_worker,
+            args=(sweep_data, temperature_data, user_input),
+            daemon=True
+        ).start()
         
     iv_temp_window = tk.Toplevel(root)
     iv_temp_window.title("IV Sweep at Different Temperatures")
@@ -3170,7 +3267,6 @@ def IV_Temp():
     tk.Button(controls_frame, text="Measurement start", command=run).pack(side=tk.RIGHT)
 
     return iv_temp_window  # Return the window to keep it open
-
 
 iv_section_frames = []  # List to hold the frames for IV sweep data
 temp_section_frames = []  # List to hold the frames for temperature data
