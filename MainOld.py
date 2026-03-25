@@ -4723,6 +4723,21 @@ def Find_JJ():
             dev.smua.measure.filter.moving = 1
             dev.smua.measure.filter.enable = 1
         except Exception: pass
+        # keep autorange enabled whenever supported by the connected SMU API
+        for attr in (
+            "measure.autorangei",
+            "measure.autorangev",
+            "source.autorangei",
+            "source.autorangev",
+        ):
+            try:
+                obj = dev.smua
+                parts = attr.split(".")
+                for p in parts[:-1]:
+                    obj = getattr(obj, p)
+                setattr(obj, parts[-1], 1)
+            except Exception:
+                pass
 
     def _apply_I(dev, I_A):
         try: k.apply_current(dev.smua, float(I_A))
@@ -4790,7 +4805,7 @@ def Find_JJ():
             I = max(I + min_step_uA, I * grow)
         return [x * 1e-6 for x in seq_uA]  # -> A
 
-    def _pretty_sweep_points(Ic_A, pts_total=300, dense_factor=4.0, over_factor=1.05):
+    def _pretty_sweep_points(Ic_A, pts_total=300, dense_factor=4.0, over_factor=1.05, two_point=False):
         """
         Build current grid for a nice IV around Ic:
           - overall range: 0 → over_factor*Ic (up & down)
@@ -4799,6 +4814,9 @@ def Find_JJ():
         """
         Ic = max(abs(Ic_A), 1e-12)
         Imax = over_factor * Ic
+        if two_point:
+            up = [0.0, Imax]
+            return up, list(reversed(up))
 
         z1 = (0.0, 0.5 * Ic)
         z2 = (0.5 * Ic, 0.9 * Ic)
@@ -4851,6 +4869,7 @@ def Find_JJ():
     win.geometry("+140+100")
 
     stop_event = threading.Event()
+    stop_reason = {'msg': None}
     ui_closed = {'flag': False}
 
     def ui_alive():
@@ -4924,22 +4943,38 @@ def Find_JJ():
 
     ttk.Label(prett, text="Jitter (fraction of Imax)").grid(row=1, column=2, sticky="e")
     e_jitter = ttk.Entry(prett, width=10); e_jitter.insert(0, "0.005"); e_jitter.grid(row=1, column=3, sticky="w")
+    two_point_mode = tk.IntVar(value=0)
+    tk.Checkbutton(prett, text="2-point mode (0 and Imax only)", variable=two_point_mode)\
+        .grid(row=1, column=4, columnspan=2, sticky="w", padx=4)
+
+    axesf = ttk.LabelFrame(win, text="Axes scaling")
+    axesf.grid(row=2, column=0, sticky="ew", padx=10, pady=(0, 6))
+    auto_axes = tk.IntVar(value=1)
+    tk.Checkbutton(axesf, text="Auto scale", variable=auto_axes).grid(row=0, column=0, sticky="w", padx=4)
+    ttk.Label(axesf, text="X min").grid(row=0, column=1, sticky="e")
+    e_xmin = ttk.Entry(axesf, width=10); e_xmin.insert(0, "-0.001"); e_xmin.grid(row=0, column=2, sticky="w")
+    ttk.Label(axesf, text="X max").grid(row=0, column=3, sticky="e")
+    e_xmax = ttk.Entry(axesf, width=10); e_xmax.insert(0, "0.001"); e_xmax.grid(row=0, column=4, sticky="w")
+    ttk.Label(axesf, text="Y min").grid(row=0, column=5, sticky="e")
+    e_ymin = ttk.Entry(axesf, width=10); e_ymin.insert(0, "-0.01"); e_ymin.grid(row=0, column=6, sticky="w")
+    ttk.Label(axesf, text="Y max").grid(row=0, column=7, sticky="e")
+    e_ymax = ttk.Entry(axesf, width=10); e_ymax.insert(0, "0.01"); e_ymax.grid(row=0, column=8, sticky="w")
 
     # Buttons / status
-    btns = ttk.Frame(win); btns.grid(row=3, column=0, sticky="ew", padx=10, pady=6)
+    btns = ttk.Frame(win); btns.grid(row=4, column=0, sticky="ew", padx=10, pady=6)
     start_btn = ttk.Button(btns, text="Start")
     stop_btn  = ttk.Button(btns, text="Stop", state=tk.DISABLED)
     start_btn.pack(side=tk.RIGHT, padx=5); stop_btn.pack(side=tk.RIGHT, padx=5)
 
     status = ttk.Label(win, text="Ready.")
-    status.grid(row=4, column=0, sticky="w", padx=10, pady=(0,8))
+    status.grid(row=5, column=0, sticky="w", padx=10, pady=(0,8))
 
     # Plot
     fig = Figure(figsize=(6.8, 4.6), dpi=100)
     ax  = fig.add_subplot(111)
     canvas = FigureCanvasTkAgg(fig, master=win)
-    canvas.draw(); canvas.get_tk_widget().grid(row=2, column=0, sticky="nsew", padx=10, pady=6)
-    win.grid_rowconfigure(2, weight=1); win.grid_columnconfigure(0, weight=1)
+    canvas.draw(); canvas.get_tk_widget().grid(row=3, column=0, sticky="nsew", padx=10, pady=6)
+    win.grid_rowconfigure(3, weight=1); win.grid_columnconfigure(0, weight=1)
 
     # Lines (will be re-created on reset)
     lines = {}
@@ -4964,7 +4999,29 @@ def Find_JJ():
         lines["neg_towards"], = ax.plot([], [], linestyle="None", marker="x", markersize=3, color="orange", label="− towards (→0)")
 
         ax.legend(loc="best")
+        if not bool(auto_axes.get()):
+            try:
+                ax.set_xlim(float(e_xmin.get()), float(e_xmax.get()))
+                ax.set_ylim(float(e_ymin.get()), float(e_ymax.get()))
+            except Exception:
+                pass
         canvas.draw_idle()
+
+    def _apply_axes_from_ui():
+        if bool(auto_axes.get()):
+            ax.relim()
+            ax.autoscale_view()
+        else:
+            try:
+                ax.set_xlim(float(e_xmin.get()), float(e_xmax.get()))
+                ax.set_ylim(float(e_ymin.get()), float(e_ymax.get()))
+            except Exception as ex:
+                if ui_alive():
+                    win.after(0, lambda: messagebox.showerror("Find JJ", f"Invalid axis limits: {ex}"))
+                return
+        canvas.draw_idle()
+
+    ttk.Button(axesf, text="Apply", command=_apply_axes_from_ui).grid(row=0, column=9, padx=6)
 
     _make_plot_fresh("Find JJ (ready)")
 
@@ -4987,8 +5044,9 @@ def Find_JJ():
                 if ln is None:
                     return
                 ln.set_data(xs, ys)
-                ax.relim()
-                ax.autoscale_view()
+                if bool(auto_axes.get()):
+                    ax.relim()
+                    ax.autoscale_view()
                 canvas.draw_idle()
             win.after(0, _upd)
 
@@ -5036,7 +5094,9 @@ def Find_JJ():
                     reasons.append("voltage limit reached")
                 if flags["current_limit"]:
                     reasons.append("current limit reached")
-                ui_set_status(f"{dev_name}: {', '.join(reasons)}. Stopping.")
+                reason_txt = f"{dev_name}: {', '.join(reasons)}. Stopping."
+                stop_reason['msg'] = reason_txt
+                ui_set_status(reason_txt)
                 stop_event.set()
                 return True
             return False
@@ -5045,7 +5105,10 @@ def Find_JJ():
         for I in _soft_ramp_sequence(I0, Imax, grow=grow, min_step_uA=min_step):
             if stop_event.is_set() or not ui_alive(): break
             if not _guard_T():
-                ui_set_status(f"{dev_name}: ΔT exceeded. Stopping.")
+                reason_txt = f"{dev_name}: temperature limit exceeded (ΔT max). Stopping."
+                stop_reason['msg'] = reason_txt
+                ui_set_status(reason_txt)
+                stop_event.set()
                 break
             _apply_I(dev, +I)
             if settle_s > 0: time.sleep(settle_s)
@@ -5065,7 +5128,11 @@ def Find_JJ():
         if markers["Ic_plus"] is not None and not stop_event.is_set() and ui_alive():
             for I in reversed(_soft_ramp_sequence(I0, abs(markers["Ic_plus"])*1e6, grow=grow, min_step_uA=min_step)):
                 if stop_event.is_set() or not ui_alive(): break
-                if not _guard_T(): break
+                if not _guard_T():
+                    stop_reason['msg'] = f"{dev_name}: temperature limit exceeded (ΔT max). Stopping."
+                    ui_set_status(stop_reason['msg'])
+                    stop_event.set()
+                    break
                 _apply_I(dev, +I)
                 if settle_s > 0: time.sleep(settle_s)
                 i, v = _meas_iv(dev)
@@ -5084,7 +5151,11 @@ def Find_JJ():
         if do_neg and not stop_event.is_set() and ui_alive():
             for I in _soft_ramp_sequence(I0, Imax, grow=grow, min_step_uA=min_step):
                 if stop_event.is_set() or not ui_alive(): break
-                if not _guard_T(): break
+                if not _guard_T():
+                    stop_reason['msg'] = f"{dev_name}: temperature limit exceeded (ΔT max). Stopping."
+                    ui_set_status(stop_reason['msg'])
+                    stop_event.set()
+                    break
                 _apply_I(dev, -I)
                 if settle_s > 0: time.sleep(settle_s)
                 i, v = _meas_iv(dev)
@@ -5103,7 +5174,11 @@ def Find_JJ():
             if markers["Ic_minus"] is not None and not stop_event.is_set() and ui_alive():
                 for I in reversed(_soft_ramp_sequence(I0, abs(markers["Ic_minus"])*1e6, grow=grow, min_step_uA=min_step)):
                     if stop_event.is_set() or not ui_alive(): break
-                    if not _guard_T(): break
+                    if not _guard_T():
+                        stop_reason['msg'] = f"{dev_name}: temperature limit exceeded (ΔT max). Stopping."
+                        ui_set_status(stop_reason['msg'])
+                        stop_event.set()
+                        break
                     _apply_I(dev, -I)
                     if settle_s > 0: time.sleep(settle_s)
                     i, v = _meas_iv(dev)
@@ -5139,7 +5214,13 @@ def Find_JJ():
             cycles    = params["pretty_cycles"]
             jitter    = params["pretty_jitter_frac"]
 
-            base_up, base_down = _pretty_sweep_points(Ic_val, pts_total=pts_total, dense_factor=dense, over_factor=over)
+            base_up, base_down = _pretty_sweep_points(
+                Ic_val,
+                pts_total=pts_total,
+                dense_factor=dense,
+                over_factor=over,
+                two_point=bool(params.get("two_point_mode", False)),
+            )
             label_sign = '+' if sign > 0 else '-'
 
             for cyc in range(1, cycles + 1):
@@ -5150,7 +5231,11 @@ def Find_JJ():
                 # Up sweep: away from 0
                 for Iabs in up:
                     if stop_event.is_set() or not ui_alive(): break
-                    if not _guard_T(): break
+                    if not _guard_T():
+                        stop_reason['msg'] = f"{dev_name}: temperature limit exceeded (ΔT max). Stopping."
+                        ui_set_status(stop_reason['msg'])
+                        stop_event.set()
+                        break
                     _apply_I(dev, sign * Iabs)
                     if settle_s > 0: time.sleep(settle_s)
                     i, v = _meas_iv(dev)
@@ -5168,7 +5253,11 @@ def Find_JJ():
                 # Down sweep: towards 0
                 for Iabs in down:
                     if stop_event.is_set() or not ui_alive(): break
-                    if not _guard_T(): break
+                    if not _guard_T():
+                        stop_reason['msg'] = f"{dev_name}: temperature limit exceeded (ΔT max). Stopping."
+                        ui_set_status(stop_reason['msg'])
+                        stop_event.set()
+                        break
                     _apply_I(dev, sign * Iabs)
                     if settle_s > 0: time.sleep(settle_s)
                     i, v = _meas_iv(dev)
@@ -5211,6 +5300,7 @@ def Find_JJ():
     # ----- main worker -----
     def _worker():
         try:
+            stop_reason['msg'] = None
             ui_set_buttons(False, True)
             ui_set_status("Configuring…")
             use_smua, use_smub = bool(use1.get()), bool(use2.get())
@@ -5232,11 +5322,12 @@ def Find_JJ():
                 settle_s = float(e_settle.get()) * 1e-3,
                 neg_branch = int(neg_branch.get()),
                 T0 = _tempK(),
-                pretty_pts_total = max(60, int(float(e_pts.get()))),
+                pretty_pts_total = max(2, int(float(e_pts.get()))),
                 pretty_dense_factor = float(e_dense.get()),
                 pretty_over_factor  = float(e_over.get()),
                 pretty_cycles = max(1, int(float(e_cycles.get()))),
                 pretty_jitter_frac = max(0.0, float(e_jitter.get())),
+                two_point_mode = int(two_point_mode.get()),
             )
 
             # ask filename on UI thread
@@ -5298,6 +5389,8 @@ def Find_JJ():
         finally:
             for dev in (k, k2):
                 _output_off(dev)
+            if stop_reason['msg'] and ui_alive():
+                win.after(0, lambda: messagebox.showwarning("Find JJ stopped", stop_reason['msg']))
             ui_set_buttons(True, False)
 
     def _stop():
@@ -5332,6 +5425,20 @@ def Find_JJ_at_Several_Temperatures():
             dev.smua.source.limitv = float(vlimit_V)
         except Exception:
             pass
+        for attr in (
+            "measure.autorangei",
+            "measure.autorangev",
+            "source.autorangei",
+            "source.autorangev",
+        ):
+            try:
+                obj = dev.smua
+                parts = attr.split(".")
+                for p in parts[:-1]:
+                    obj = getattr(obj, p)
+                setattr(obj, parts[-1], 1)
+            except Exception:
+                pass
 
     def _apply_I(dev, I_A):
         try:
@@ -5349,6 +5456,27 @@ def Find_JJ_at_Several_Temperatures():
                 return float(dev.smua.measure.i()), float(dev.smua.measure.v())
             except Exception:
                 return float('nan'), float('nan')
+
+    def _measurement_flags(dev, i, v, cmd_i_A, vlimit_V):
+        flags = {"invalid": False, "voltage_limit": False, "current_limit": False}
+        if (not np.isfinite(i)) or (not np.isfinite(v)) or abs(i) >= 1e30 or abs(v) >= 1e30:
+            flags["invalid"] = True
+        try:
+            if bool(dev.smua.source.compliance):
+                flags["voltage_limit"] = True
+        except Exception:
+            pass
+        if np.isfinite(v) and vlimit_V > 0 and abs(v) >= 0.995 * abs(vlimit_V):
+            flags["voltage_limit"] = True
+        try:
+            lim_i = float(dev.smua.source.limiti)
+            if np.isfinite(i) and lim_i > 0 and abs(i) >= 0.995 * abs(lim_i):
+                flags["current_limit"] = True
+        except Exception:
+            pass
+        if np.isfinite(i) and np.isfinite(cmd_i_A) and abs(cmd_i_A) > 0 and abs(i) > 1000.0 * abs(cmd_i_A):
+            flags["invalid"] = True
+        return flags
 
     def _output_off(dev):
         try: dev.smua.source.output = 0
@@ -5428,6 +5556,7 @@ def Find_JJ_at_Several_Temperatures():
     win.geometry("+180+120")
 
     stop_event = threading.Event()
+    stop_reason = {'msg': None}
     ui_closed = {'flag': False}
     section_frames = []
 
@@ -5495,16 +5624,31 @@ def Find_JJ_at_Several_Temperatures():
     cyclesf.grid(row=3, column=0, sticky="ew", padx=10, pady=4)
     ttk.Label(cyclesf, text="Cycles per temperature").pack(side=tk.LEFT)
     e_cycles = ttk.Entry(cyclesf, width=10); e_cycles.insert(0, "1"); e_cycles.pack(side=tk.LEFT, padx=6)
+    two_point_mode = tk.IntVar(value=0)
+    ttk.Checkbutton(cyclesf, text="2-point mode", variable=two_point_mode).pack(side=tk.LEFT, padx=6)
     ttk.Button(cyclesf, text="Add section", command=_add_section).pack(side=tk.LEFT, padx=8)
 
+    axesf = ttk.LabelFrame(win, text="Axes scaling")
+    axesf.grid(row=4, column=0, sticky="ew", padx=10, pady=4)
+    auto_axes = tk.IntVar(value=1)
+    tk.Checkbutton(axesf, text="Auto scale", variable=auto_axes).grid(row=0, column=0, sticky="w", padx=4)
+    ttk.Label(axesf, text="X min").grid(row=0, column=1, sticky="e")
+    e_xmin = ttk.Entry(axesf, width=10); e_xmin.insert(0, "-0.001"); e_xmin.grid(row=0, column=2, sticky="w")
+    ttk.Label(axesf, text="X max").grid(row=0, column=3, sticky="e")
+    e_xmax = ttk.Entry(axesf, width=10); e_xmax.insert(0, "0.001"); e_xmax.grid(row=0, column=4, sticky="w")
+    ttk.Label(axesf, text="Y min").grid(row=0, column=5, sticky="e")
+    e_ymin = ttk.Entry(axesf, width=10); e_ymin.insert(0, "-0.01"); e_ymin.grid(row=0, column=6, sticky="w")
+    ttk.Label(axesf, text="Y max").grid(row=0, column=7, sticky="e")
+    e_ymax = ttk.Entry(axesf, width=10); e_ymax.insert(0, "0.01"); e_ymax.grid(row=0, column=8, sticky="w")
+
     btnf = ttk.Frame(win)
-    btnf.grid(row=4, column=0, sticky="ew", padx=10, pady=4)
+    btnf.grid(row=5, column=0, sticky="ew", padx=10, pady=4)
     start_btn = ttk.Button(btnf, text="Start")
     stop_btn = ttk.Button(btnf, text="Stop", state=tk.DISABLED)
     start_btn.pack(side=tk.RIGHT, padx=4); stop_btn.pack(side=tk.RIGHT, padx=4)
 
     status = ttk.Label(win, text="Ready.")
-    status.grid(row=5, column=0, sticky="w", padx=10, pady=(0, 8))
+    status.grid(row=6, column=0, sticky="w", padx=10, pady=(0, 8))
 
     fig = Figure(figsize=(7.2, 4.8), dpi=100)
     ax = fig.add_subplot(111)
@@ -5513,8 +5657,8 @@ def Find_JJ_at_Several_Temperatures():
     ax.set_ylabel("V (V)")
     canvas = FigureCanvasTkAgg(fig, master=win)
     canvas.draw()
-    canvas.get_tk_widget().grid(row=6, column=0, sticky="nsew", padx=10, pady=6)
-    win.grid_rowconfigure(6, weight=1); win.grid_columnconfigure(0, weight=1)
+    canvas.get_tk_widget().grid(row=7, column=0, sticky="nsew", padx=10, pady=6)
+    win.grid_rowconfigure(7, weight=1); win.grid_columnconfigure(0, weight=1)
 
     def ui_status(msg):
         if ui_alive():
@@ -5527,8 +5671,13 @@ def Find_JJ_at_Several_Temperatures():
 
     def ui_plot_point(i_val, v_val, color):
         if ui_alive():
-            win.after(0, lambda: (ax.plot(i_val, v_val, marker='.', linestyle='None', color=color, alpha=0.85),
-                                  canvas.draw_idle()))
+            def _upd():
+                ax.plot(i_val, v_val, marker='.', linestyle='None', color=color, alpha=0.85)
+                if bool(auto_axes.get()):
+                    ax.relim()
+                    ax.autoscale_view()
+                canvas.draw_idle()
+            win.after(0, _upd)
 
     def ui_add_legend_entry(dev_name, style, color, reached_t, enable_legend):
         if ui_alive():
@@ -5536,11 +5685,33 @@ def Find_JJ_at_Several_Temperatures():
                 ax.plot([], [], linestyle=style, color=color, label=f"{dev_name} @ {reached_t:.3f} K")
                 if enable_legend:
                     ax.legend(loc="best", fontsize=8)
+                if not bool(auto_axes.get()):
+                    try:
+                        ax.set_xlim(float(e_xmin.get()), float(e_xmax.get()))
+                        ax.set_ylim(float(e_ymin.get()), float(e_ymax.get()))
+                    except Exception:
+                        pass
                 canvas.draw_idle()
             win.after(0, _upd)
 
+    def _apply_axes_from_ui():
+        if bool(auto_axes.get()):
+            ax.relim()
+            ax.autoscale_view()
+        else:
+            try:
+                ax.set_xlim(float(e_xmin.get()), float(e_xmax.get()))
+                ax.set_ylim(float(e_ymin.get()), float(e_ymax.get()))
+            except Exception as ex:
+                messagebox.showerror("Find JJ T-sweep", f"Invalid axis limits: {ex}")
+                return
+        canvas.draw_idle()
+
+    ttk.Button(axesf, text="Apply", command=_apply_axes_from_ui).grid(row=0, column=9, padx=6)
+
     def _worker(run_cfg):
         try:
+            stop_reason['msg'] = None
             ui_buttons(False, True)
             use_smua, use_smub = run_cfg["use_smua"], run_cfg["use_smub"]
             if not (use_smua or use_smub):
@@ -5560,6 +5731,12 @@ def Find_JJ_at_Several_Temperatures():
             ax.cla()
             ax.set_title(f"Find JJ at several temperatures — {run_cfg['base']}")
             ax.set_xlabel("I (A)"); ax.set_ylabel("V (V)")
+            if not bool(auto_axes.get()):
+                try:
+                    ax.set_xlim(float(e_xmin.get()), float(e_xmax.get()))
+                    ax.set_ylim(float(e_ymin.get()), float(e_ymax.get()))
+                except Exception:
+                    pass
 
             for t_idx, target_t in enumerate(temps):
                 if stop_event.is_set() or not ui_alive():
@@ -5574,6 +5751,8 @@ def Find_JJ_at_Several_Temperatures():
                     stop_event
                 )
                 if reached_t is None:
+                    if not stop_reason['msg']:
+                        stop_reason['msg'] = f"Temperature {target_t:.3f} K was not reached (stopped or timeout)."
                     break
                 if run_cfg["settle_after_t_s"] > 0:
                     time.sleep(run_cfg["settle_after_t_s"])
@@ -5583,7 +5762,10 @@ def Find_JJ_at_Several_Temperatures():
 
                 for cyc in range(1, run_cfg["cycles"] + 1):
                     for sec_idx, (i0_uA, i1_uA, nsteps) in enumerate(run_cfg["sections"], start=1):
-                        setpoints_A = np.linspace(i0_uA * 1e-6, i1_uA * 1e-6, nsteps)
+                        if run_cfg.get("two_point_mode", 0):
+                            setpoints_A = [i0_uA * 1e-6, i1_uA * 1e-6]
+                        else:
+                            setpoints_A = np.linspace(i0_uA * 1e-6, i1_uA * 1e-6, nsteps)
                         for sp_A in setpoints_A:
                             if stop_event.is_set() or not ui_alive():
                                 break
@@ -5592,11 +5774,38 @@ def Find_JJ_at_Several_Temperatures():
                                 if run_cfg["point_settle_s"] > 0:
                                     time.sleep(run_cfg["point_settle_s"])
                                 im, vm = _meas_iv(dev)
+                                flags = _measurement_flags(dev, im, vm, cmd_i_A=sp_A, vlimit_V=run_cfg["vlimit"])
+                                if flags["invalid"] or flags["voltage_limit"] or flags["current_limit"]:
+                                    reasons = []
+                                    if flags["invalid"]:
+                                        reasons.append("invalid IV readback")
+                                    if flags["voltage_limit"]:
+                                        reasons.append("voltage limit reached")
+                                    if flags["current_limit"]:
+                                        reasons.append("current limit reached")
+                                    stop_reason['msg'] = f"{dev_name}: {', '.join(reasons)}. Stopping."
+                                    ui_status(stop_reason['msg'])
+                                    stop_event.set()
+                                    break
                                 ts = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                                 Tk = _tempK()
+                                if Tk > (target_t + run_cfg["t_tol"]):
+                                    stop_reason['msg'] = (
+                                        f"{dev_name}: temperature exceeded tolerance at {Tk:.3f} K "
+                                        f"(target {target_t:.3f} K ± {run_cfg['t_tol']:.3f} K)."
+                                    )
+                                    ui_status(stop_reason['msg'])
+                                    stop_event.set()
+                                    break
                                 this_temp_rows.append((ts, f"{Tk:.6f}", dev_name, str(cyc), str(sec_idx),
                                                        f"{sp_A:.12e}", f"{im:.12e}", f"{vm:.12e}"))
                                 ui_plot_point(im, vm, color)
+                            if stop_event.is_set():
+                                break
+                        if stop_event.is_set():
+                            break
+                    if stop_event.is_set():
+                        break
 
                 temp_tag = f"{reached_t:.3f}".replace(".", "p")
                 _dual_save_csv_and_txt(
@@ -5616,6 +5825,8 @@ def Find_JJ_at_Several_Temperatures():
             for dev in (k, k2):
                 _apply_I(dev, 0.0)
                 _output_off(dev)
+            if stop_reason['msg'] and ui_alive():
+                win.after(0, lambda: messagebox.showwarning("Find JJ T-sweep stopped", stop_reason['msg']))
             ui_buttons(True, False)
 
     def _stop():
@@ -5666,6 +5877,7 @@ def Find_JJ_at_Several_Temperatures():
                 vlimit=vlimit,
                 point_settle_s=point_settle_s,
                 cycles=cycles,
+                two_point_mode=int(two_point_mode.get()),
                 sections=sections,
                 base=_dated(base),
             )
