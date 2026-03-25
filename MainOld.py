@@ -4738,6 +4738,46 @@ def Find_JJ():
             try: return float(dev.smua.measure.i()), float(dev.smua.measure.v())
             except Exception: return float('nan'), float('nan')
 
+    def _measurement_flags(dev, i, v, cmd_i_A, vlimit_V):
+        """
+        Detect invalid points and likely compliance (voltage/current limit) events.
+        Keithley-style overflow/sentinel values are often around 1e38.
+        """
+        flags = {
+            "invalid": False,
+            "voltage_limit": False,
+            "current_limit": False,
+        }
+
+        # non-finite / overflow-style sentinels
+        if (not np.isfinite(i)) or (not np.isfinite(v)) or abs(i) >= 1e30 or abs(v) >= 1e30:
+            flags["invalid"] = True
+
+        # explicit compliance flag if available
+        try:
+            if bool(dev.smua.source.compliance):
+                flags["voltage_limit"] = True
+        except Exception:
+            pass
+
+        # infer voltage-limit hit from measured voltage
+        if np.isfinite(v) and vlimit_V > 0 and abs(v) >= 0.995 * abs(vlimit_V):
+            flags["voltage_limit"] = True
+
+        # infer current-limit hit from configured source current limit (if exposed)
+        try:
+            lim_i = float(dev.smua.source.limiti)
+            if np.isfinite(i) and lim_i > 0 and abs(i) >= 0.995 * abs(lim_i):
+                flags["current_limit"] = True
+        except Exception:
+            pass
+
+        # additional guard: huge mismatch between commanded and measured current often means invalid readback
+        if np.isfinite(i) and np.isfinite(cmd_i_A) and abs(cmd_i_A) > 0 and abs(i) > 1000.0 * abs(cmd_i_A):
+            flags["invalid"] = True
+
+        return flags
+
     def _output_off(dev):
         try: dev.smua.source.output = 0
         except Exception: pass
@@ -4987,6 +5027,20 @@ def Find_JJ():
         def _guard_T():
             return (_tempK() <= T0 + dT_max)
 
+        def _stop_on_limit_or_invalid(flags):
+            if flags["invalid"] or flags["voltage_limit"] or flags["current_limit"]:
+                reasons = []
+                if flags["invalid"]:
+                    reasons.append("invalid IV readback")
+                if flags["voltage_limit"]:
+                    reasons.append("voltage limit reached")
+                if flags["current_limit"]:
+                    reasons.append("current limit reached")
+                ui_set_status(f"{dev_name}: {', '.join(reasons)}. Stopping.")
+                stop_event.set()
+                return True
+            return False
+
         # + branch up (find Ic+): away from 0
         for I in _soft_ramp_sequence(I0, Imax, grow=grow, min_step_uA=min_step):
             if stop_event.is_set() or not ui_alive(): break
@@ -4996,6 +5050,9 @@ def Find_JJ():
             _apply_I(dev, +I)
             if settle_s > 0: time.sleep(settle_s)
             i, v = _meas_iv(dev)
+            flags = _measurement_flags(dev, i, v, cmd_i_A=+I, vlimit_V=params["vlimit"])
+            if _stop_on_limit_or_invalid(flags):
+                break
             ts, Tk = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'), _tempK()
             results_search.append((ts, f"{Tk:.6f}", f"{i:.12e}", f"{v:.12e}", '+', 'ramp_up', 'away'))
             xs_pos_away.append(i); ys_pos_away.append(v); ui_plot_update("pos_away", xs_pos_away[:], ys_pos_away[:])
@@ -5012,6 +5069,9 @@ def Find_JJ():
                 _apply_I(dev, +I)
                 if settle_s > 0: time.sleep(settle_s)
                 i, v = _meas_iv(dev)
+                flags = _measurement_flags(dev, i, v, cmd_i_A=+I, vlimit_V=params["vlimit"])
+                if _stop_on_limit_or_invalid(flags):
+                    break
                 ts, Tk = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'), _tempK()
                 results_search.append((ts, f"{Tk:.6f}", f"{i:.12e}", f"{v:.12e}", '+', 'ramp_down', 'towards'))
                 xs_pos_tow.append(i); ys_pos_tow.append(v); ui_plot_update("pos_towards", xs_pos_tow[:], ys_pos_tow[:])
@@ -5028,6 +5088,9 @@ def Find_JJ():
                 _apply_I(dev, -I)
                 if settle_s > 0: time.sleep(settle_s)
                 i, v = _meas_iv(dev)
+                flags = _measurement_flags(dev, i, v, cmd_i_A=-I, vlimit_V=params["vlimit"])
+                if _stop_on_limit_or_invalid(flags):
+                    break
                 ts, Tk = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'), _tempK()
                 results_search.append((ts, f"{Tk:.6f}", f"{i:.12e}", f"{v:.12e}", '-', 'ramp_up', 'away'))
                 xs_neg_away.append(i); ys_neg_away.append(v); ui_plot_update("neg_away", xs_neg_away[:], ys_neg_away[:])
@@ -5044,6 +5107,9 @@ def Find_JJ():
                     _apply_I(dev, -I)
                     if settle_s > 0: time.sleep(settle_s)
                     i, v = _meas_iv(dev)
+                    flags = _measurement_flags(dev, i, v, cmd_i_A=-I, vlimit_V=params["vlimit"])
+                    if _stop_on_limit_or_invalid(flags):
+                        break
                     ts, Tk = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'), _tempK()
                     results_search.append((ts, f"{Tk:.6f}", f"{i:.12e}", f"{v:.12e}", '-', 'ramp_down', 'towards'))
                     xs_neg_tow.append(i); ys_neg_tow.append(v); ui_plot_update("neg_towards", xs_neg_tow[:], ys_neg_tow[:])
@@ -5088,6 +5154,9 @@ def Find_JJ():
                     _apply_I(dev, sign * Iabs)
                     if settle_s > 0: time.sleep(settle_s)
                     i, v = _meas_iv(dev)
+                    flags = _measurement_flags(dev, i, v, cmd_i_A=(sign * Iabs), vlimit_V=params["vlimit"])
+                    if _stop_on_limit_or_invalid(flags):
+                        break
                     ts, Tk = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'), _tempK()
                     results_sweep.append((ts, f"{Tk:.6f}", f"{i:.12e}", f"{v:.12e}", label_sign, 'pretty_up', 'away', str(cyc)))
 
@@ -5103,6 +5172,9 @@ def Find_JJ():
                     _apply_I(dev, sign * Iabs)
                     if settle_s > 0: time.sleep(settle_s)
                     i, v = _meas_iv(dev)
+                    flags = _measurement_flags(dev, i, v, cmd_i_A=(sign * Iabs), vlimit_V=params["vlimit"])
+                    if _stop_on_limit_or_invalid(flags):
+                        break
                     ts, Tk = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'), _tempK()
                     results_sweep.append((ts, f"{Tk:.6f}", f"{i:.12e}", f"{v:.12e}", label_sign, 'pretty_down', 'towards', str(cyc)))
 
