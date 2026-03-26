@@ -3268,6 +3268,231 @@ def IV_Temp():
 
     return iv_temp_window  # Return the window to keep it open
 
+def IV_During_Cooldown():
+    """
+    Kontinuierliche IV-Sweeps während des Cooldowns bis zu einer Endtemperatur.
+    Messmodus: 2-Punkt (SMU1 lokal), zusätzlich Sense-Spannung über SMU2.
+    Nach jedem Sweep wird separat gespeichert inkl. gemessenem Temperaturbereich.
+    """
+    global measurement
+    measurement = 1
+
+    TEMP_TOLERANCE_K = 0.05
+    MIN_END_TEMP_K = 3.3
+    MAX_TEMP_K = 290.0
+
+    cooldown_section_frames = []
+
+    def _query_sample_temperature():
+        try:
+            return float(client.query('T_sample.kelvin') or 300)
+        except Exception:
+            return 300.0
+
+    def add_iv_section():
+        frame = create_section_frame(iv_sections_frame)
+        frame.pack(fill=tk.X)
+        cooldown_section_frames.append(frame)
+
+    def run_single_iv_sweep_with_sense(sweep_points, use_smu2_sense):
+        global rt, rt2
+        rt = ResultTable(
+            column_titles=['Time', 'Voltage[V]', 'Current [A]', 'Temperature[K]'],
+            units=[' ', 'V', 'A', 'K'],
+            params={'recorded': time.asctime(), 'sweep_type': 'iv_cooldown_2pt'},
+        )
+        rt2 = False
+        if use_smu2_sense:
+            rt2 = ResultTable(
+                column_titles=['Time', 'Voltage[V]', 'SenseVoltage[V]', 'Temperature[K]'],
+                units=[' ', 'V', 'V', 'K'],
+                params={'recorded': time.asctime(), 'sweep_type': 'iv_cooldown_sense'},
+            )
+
+        temperatures = []
+
+        # 2-Punkt auf SMU1
+        k.smua.sense = k.smua.SENSE_LOCAL
+        # SMU2 optional als Voltmeter (0 A Source)
+        if use_smu2_sense:
+            k2.smua.sense = k2.smua.SENSE_LOCAL
+
+        k.smua.source.output = 1
+        k.smua.source.func = 1  # voltage source
+        k.smua.measure.nplc = integrationtime
+
+        if use_smu2_sense:
+            k2.smua.source.output = 1
+            k2.smua.source.func = 2  # current source
+            k2.smua.source.leveli = 0.0
+            k2.smua.measure.nplc = integrationtime
+
+        for start, end, steps in sweep_points:
+            voltages = [round(start + (end - start) * j / steps, 6) for j in range(steps)]
+            for v_set in voltages:
+                if measurement == 0:
+                    break
+                k.smua.source.levelv = v_set
+                time.sleep(0.1)
+
+                T = _query_sample_temperature()
+                ts = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                i_meas = float(k.smua.measure.i())
+                v_meas = float(k.smua.measure.v())
+                if use_smu2_sense:
+                    v_sense = float(k2.smua.measure.v())
+
+                rt.append_row([ts, v_meas, i_meas, T])
+                if use_smu2_sense:
+                    rt2.append_row([ts, v_meas, v_sense, T])
+                temperatures.append(T)
+
+            if measurement == 0:
+                break
+
+        return temperatures
+
+    def run_worker(sweep_points, target_end_temp, ramp_speed, pause_s, user_input, use_smu2_sense):
+        try:
+            # Cooldown starten
+            temperature_control.start((float(target_end_temp), float(ramp_speed)))
+            sweep_index = 1
+
+            while measurement == 1:
+                temps = run_single_iv_sweep_with_sense(sweep_points, use_smu2_sense)
+                if not temps:
+                    break
+
+                t_min = min(temps)
+                t_max = max(temps)
+                suffix = f"_cooldown_{sweep_index:03d}_{t_min:.3f}-{t_max:.3f}K"
+                filename_main = f"{user_input}{suffix}"
+                filename_sense = f"{user_input}{suffix}_sense"
+
+                data_numeric = np.array([[ts] + list(map(float, vals)) for ts, *vals in rt.data])
+                safe_file(data_numeric, filename_main)
+                if use_smu2_sense and rt2:
+                    data_numeric2 = np.array([[ts] + list(map(float, vals)) for ts, *vals in rt2.data])
+                    safe_file(data_numeric2, filename_sense)
+
+                print(f"Sweep {sweep_index} gespeichert ({t_min:.3f} K bis {t_max:.3f} K).")
+                sweep_index += 1
+
+                if _query_sample_temperature() <= (target_end_temp + TEMP_TOLERANCE_K):
+                    break
+                time.sleep(max(0.0, pause_s))
+        finally:
+            try:
+                temperature_control.stop()
+            except Exception:
+                pass
+            try:
+                k.smua.source.output = 0
+            except Exception:
+                pass
+            try:
+                k2.smua.source.output = 0
+            except Exception:
+                pass
+
+            def _finish_ui():
+                global measurement
+                measurement = 0
+                try:
+                    cooldown_window.destroy()
+                except Exception:
+                    pass
+            root.after(0, _finish_ui)
+
+    def run():
+        sweep_points = []
+        for frame in cooldown_section_frames:
+            try:
+                start = float(frame.winfo_children()[1].get())
+                end = float(frame.winfo_children()[3].get())
+                steps = int(frame.winfo_children()[5].get())
+                if steps <= 0:
+                    raise ValueError
+                sweep_points.append((start, end, steps))
+            except ValueError:
+                tk.messagebox.showerror("Error", "Ungültige IV Sweep Eingabe.")
+                return
+            except tk.TclError as e:
+                if "bad window path name" not in str(e):
+                    raise e
+
+        try:
+            target_end_temp = float(end_temp_entry.get())
+            ramp_speed = float(ramp_speed_entry.get())
+            pause_s = float(pause_entry.get())
+        except ValueError:
+            tk.messagebox.showerror("Error", "Ungültige Cooldown Eingabe.")
+            return
+
+        if target_end_temp < MIN_END_TEMP_K:
+            Errormessage("Endtemperatur muss mindestens 3.3 K sein.")
+            target_end_temp = MIN_END_TEMP_K
+            end_temp_entry.delete(0, tk.END)
+            end_temp_entry.insert(0, str(MIN_END_TEMP_K))
+        elif target_end_temp > MAX_TEMP_K:
+            Errormessage("Endtemperatur außerhalb des Bereichs (3.3-290 K).")
+            target_end_temp = MAX_TEMP_K
+            end_temp_entry.delete(0, tk.END)
+            end_temp_entry.insert(0, str(MAX_TEMP_K))
+
+        user_input = simpledialog.askstring("Insert Filename", "Please insert the file Name:")
+        if user_input is None:
+            global measurement
+            measurement = 0
+            return
+
+        threading.Thread(
+            target=run_worker,
+            args=(sweep_points, target_end_temp, ramp_speed, pause_s, user_input, use_smu2_sense_var.get() == 1),
+            daemon=True
+        ).start()
+
+    cooldown_window = tk.Toplevel(root)
+    cooldown_window.title("IV During Cooldown")
+    cooldown_window.protocol("WM_DELETE_WINDOW", lambda: on_closing(cooldown_window))
+
+    iv_sections_frame = tk.Frame(cooldown_window)
+    iv_sections_frame.pack(padx=10, pady=10)
+    tk.Label(iv_sections_frame, text="Sweep sections are interpreted as VOLTAGE in V (Start/End/Steps). Example: 0→1→-1→0 V via 3 sections.").pack(anchor="w")
+    add_iv_section()
+
+    settings_frame = tk.Frame(cooldown_window)
+    settings_frame.pack(fill=tk.X, padx=10, pady=5)
+
+    tk.Label(settings_frame, text="End Temperature [K] (min 3.3)").grid(row=0, column=0, sticky="w")
+    end_temp_entry = tk.Entry(settings_frame, width=10)
+    end_temp_entry.grid(row=1, column=0, padx=(0, 10), sticky="w")
+    end_temp_entry.insert(0, "3.3")
+
+    tk.Label(settings_frame, text="Ramp Speed [K/min]").grid(row=0, column=1, sticky="w")
+    ramp_speed_entry = tk.Entry(settings_frame, width=10)
+    ramp_speed_entry.grid(row=1, column=1, padx=(0, 10), sticky="w")
+    ramp_speed_entry.insert(0, "1")
+
+    tk.Label(settings_frame, text="Pause between sweeps [s]").grid(row=0, column=2, sticky="w")
+    pause_entry = tk.Entry(settings_frame, width=10)
+    pause_entry.grid(row=1, column=2, sticky="w")
+    pause_entry.insert(0, "0")
+
+    use_smu2_sense_var = tk.IntVar(value=1)
+    tk.Checkbutton(
+        settings_frame,
+        text="Use SMU2 for sense voltage",
+        variable=use_smu2_sense_var
+    ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(8, 0))
+
+    controls_frame = tk.Frame(cooldown_window)
+    controls_frame.pack(fill=tk.X, padx=10, pady=10)
+    tk.Button(controls_frame, text="Add Section (IV)", command=add_iv_section).pack(side=tk.LEFT)
+    tk.Button(controls_frame, text="Start Cooldown Measurement", command=run).pack(side=tk.RIGHT)
+
+    return cooldown_window
+
 iv_section_frames = []  # List to hold the frames for IV sweep data
 temp_section_frames = []  # List to hold the frames for temperature data
 
@@ -6512,6 +6737,7 @@ add_button_with_details_and_load(
 add_button_with_details_and_load(iv_frame, "Single IV Curve Current", create_sweep_current, "Start: Start Current in muA, End: End Current in muA, Steps: Amount of Steps (Integer). Checkbox Unchecked: Connect SMU1 HI and SMU1 LO to your device. Checkbox Checked: Connect SMU1 HI and SMU1 LO to your device as outer electrodes and SMU1 Sense Hi and SMU1 Sense Lo as inner electrodes. Range: -0.1A;0.1A",load_sweep_current)
 add_button_with_details_and_load(iv_frame, "Single IV Curve Voltage", create_sweep, "Start: Start Voltage, End: End Voltage, Steps: Amount of Steps (Integer). Connect SMU1 HI and SMU1 LO to your device. Range: -20V;20V",load_sweep)
 add_button_with_details(tc_frame, "Voltage sweep at several temperatures", IV_Temp, "Connect SMU1 HI and SMU1 LO to your device. Range: -20;20V, 0.2K;290K")
+add_button_with_details(tc_frame, "IV During Cooldown", IV_During_Cooldown, "Kontinuierlicher 2-Punkt IV Sweep (Spannungs-Sweep in V) während Cooldown bis Endtemperatur (min. 3.3 K). Optional kann SMU2 für zusätzliche Sense-Spannung genutzt werden; jeder Sweep wird separat mit Temperaturbereich gespeichert.")
 add_button_with_details(tc_frame, "2 Point Tc Measurement", create_tc_measurement, "Connect SMU1 HI and SMU1 LO to your device. Range: 1muA;100mA, 0.2K;290K, high power might reduce Temperature Range. Recommended: 100muA")
 add_button_with_details(tc_frame, "4-point Tc Measurement 2 SMU Classic", create_4ptc_measurement, "Connect SMU1 HI and SMU1 LO to your device as outer electrodes and SMU2 HI and SMU2 Lo as inner electrodes. Range 1muA;100mA, 0.2K;290K, high power might reduce Temperature Range. Recommended: 100muA")
 add_button_with_details(tc_frame, "4-point Tc Measurement 1 SMU Sense", create_4pt_measurement_Sense, "Connect SMU1 HI and SMU1 LO to your device as outer electrodes and SMU1 Sense Hi and SMU1 Sense Lo as inner electrodes. The Hi and Lo should be in Order SMU1 Hi SMU1 Sense Hi SMU1 Sense LO SMU1 LO Range: 1muA;100mA, 0.2K;290K, high power might reduce Temperature Range. Recommended: 100muA")
