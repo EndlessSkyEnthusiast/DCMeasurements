@@ -6977,6 +6977,11 @@ def TempSweepIV():
     tk.Label(iv_frame, text="Sweep path: 0 → Max → 0 → -Max → 0").grid(row=4, column=0, columnspan=4, sticky='w', padx=4)
     stop5k = tk.IntVar(value=1)
     tk.Checkbutton(win, text='Fast cooldown above 5K', variable=stop5k).pack(anchor='w', padx=12)
+    progress_var = tk.DoubleVar(value=0.0)
+    progress = ttk.Progressbar(win, variable=progress_var, maximum=100.0)
+    progress.pack(fill=tk.X, padx=10, pady=(2, 2))
+    eta_label = tk.Label(win, text="Progress: 0.0% | ETA: --:--:--")
+    eta_label.pack(fill=tk.X, padx=10)
     status = tk.Label(win, text="Ready")
     status.pack(fill=tk.X, padx=10, pady=6)
 
@@ -7052,6 +7057,7 @@ def TempSweepIV():
             sections = []
             for fr in section_frames:
                 sections.append((float(fr.target_entry.get()), float(fr.ramp_entry.get()), int(fr.regenerate_var.get())))
+            run_start_ts = time.time()
 
             if use_smu1.get():
                 _set_sense(k, bool(smu1_4wire.get()))
@@ -7084,10 +7090,20 @@ def TempSweepIV():
                 smu2_ax.set_title("All IV Curves - SMU2 (colored by T)")
                 cur_ax.set_title("Current IV Curve")
 
-            for target_t, ramp, regen in sections:
+            start_now = float(client.query('T_sample.kelvin') or 300.0)
+            planned_section_starts = [start_now]
+            for i in range(1, len(sections)):
+                planned_section_starts.append(sections[i-1][0])
+            planned_total_temp_path = 0.0
+            for i, sec in enumerate(sections):
+                planned_total_temp_path += abs(float(sec[0]) - float(planned_section_starts[i]))
+            completed_temp_path = 0.0
+
+            for sec_idx, (target_t, ramp, regen) in enumerate(sections):
                 section_start_t = float(client.query('T_sample.kelvin') or 300.0)
                 current_t = section_start_t
                 range_tag = _fmt_temp_range(section_start_t, target_t)
+                section_total_path = max(1e-12, abs(target_t - section_start_t))
                 fast_cool_mode = bool(stop5k.get() and (target_t < current_t) and (current_t > 5.0))
                 if fast_cool_mode:
                     try:
@@ -7102,6 +7118,21 @@ def TempSweepIV():
 
                 while abs(float(client.query('T_sample.kelvin') or 300.0) - target_t) > (0.05 if target_t > 3 else 0.02):
                     T_now = float(client.query('T_sample.kelvin') or 300.0)
+                    section_done = min(section_total_path, abs(section_start_t - T_now))
+                    traveled = completed_temp_path + section_done
+                    remaining = max(0.0, planned_total_temp_path - traveled)
+                    progress_pct = 100.0 * traveled / planned_total_temp_path if planned_total_temp_path > 1e-12 else 100.0
+                    elapsed_s = max(1e-9, time.time() - run_start_ts)
+                    speed = traveled / elapsed_s
+                    if speed > 1e-12 and remaining > 0:
+                        eta_s = int(remaining / speed)
+                        eta_txt = time.strftime("%H:%M:%S", time.gmtime(eta_s))
+                    elif remaining <= 0:
+                        eta_txt = "00:00:00"
+                    else:
+                        eta_txt = "--:--:--"
+                    progress_var.set(max(0.0, min(100.0, progress_pct)))
+                    eta_label.config(text=f"Progress: {progress_pct:5.1f}% | ETA: {eta_txt}")
                     if fast_cool_mode and T_now <= 5.0:
                         fast_cool_mode = False
                         if target_t > 3.0:
@@ -7157,6 +7188,7 @@ def TempSweepIV():
                         d2 = np.array([[ts] + list(map(float, vals)) for ts, *vals in new_rows_2], dtype=object)
                         safe_file(d2, f"{base}_SMU2_{range_tag}")
                         saved_rows['SMU2'] = len(rt2l.data)
+                completed_temp_path += section_total_path
 
             if stop5k.get():
                 cur_t = float(client.query('T_sample.kelvin') or 300.0)
@@ -7167,6 +7199,8 @@ def TempSweepIV():
                     try: temperature_control.stop()
                     except Exception: pass
 
+            progress_var.set(100.0)
+            eta_label.config(text="Progress: 100.0% | ETA: 00:00:00")
             status.config(text=f"Done. Incremental files in: {run_folder_primary}")
         except Exception as ex:
             status.config(text=f"Error: {ex}")
