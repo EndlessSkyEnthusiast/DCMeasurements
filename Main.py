@@ -7163,19 +7163,19 @@ def TempSweepIV():
                     for coll in smu1_ax.collections:
                         coll.set_norm(norm)
                     if smu1_cbar is None:
-                        smu1_cbar = smu1_fig.colorbar(cm.ScalarMappable(norm=norm, cmap=cmap), ax=smu1_ax)
+                        smu1_cbar = smu1_fig.colorbar(matplotlib.cm.ScalarMappable(norm=norm, cmap=cmap), ax=smu1_ax)
                         smu1_cbar.set_label("Temperature [K]")
                     else:
-                        smu1_cbar.update_normal(cm.ScalarMappable(norm=norm, cmap=cmap))
+                        smu1_cbar.update_normal(matplotlib.cm.ScalarMappable(norm=norm, cmap=cmap))
                     smu1_fig.canvas.draw_idle()
                 if smu2_ax is not None:
                     for coll in smu2_ax.collections:
                         coll.set_norm(norm)
                     if smu2_cbar is None:
-                        smu2_cbar = smu2_fig.colorbar(cm.ScalarMappable(norm=norm, cmap=cmap), ax=smu2_ax)
+                        smu2_cbar = smu2_fig.colorbar(matplotlib.cm.ScalarMappable(norm=norm, cmap=cmap), ax=smu2_ax)
                         smu2_cbar.set_label("Temperature [K]")
                     else:
-                        smu2_cbar.update_normal(cm.ScalarMappable(norm=norm, cmap=cmap))
+                        smu2_cbar.update_normal(matplotlib.cm.ScalarMappable(norm=norm, cmap=cmap))
                     smu2_fig.canvas.draw_idle()
 
             start_now = float(client.query('T_sample.kelvin') or 300.0)
