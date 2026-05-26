@@ -6597,6 +6597,50 @@ def _iv2_make_setpoints(mode, max_abs_user, steps_per_half, cyclic_back_to_zero=
         co = co + [0.0]
     return co
 
+def _iv2_make_setpoints_tempsweep(mode, max_abs_user, steps_per_half):
+    """Build piecewise sweep: 0 -> +max -> 0 -> -max (SI units)."""
+    if mode == 'I':
+        max_abs_SI = float(max_abs_user) * 1e-6
+    else:
+        max_abs_SI = float(max_abs_user) * 1e-3
+    n = max(1, int(steps_per_half))
+    up = np.linspace(0.0, max_abs_SI, n + 1)
+    down_to_zero = np.linspace(max_abs_SI, 0.0, n + 1)[1:]
+    down_to_neg = np.linspace(0.0, -max_abs_SI, n + 1)[1:]
+    return list(np.concatenate([up, down_to_zero, down_to_neg]))
+
+def _iv2_monotonic_jitter(segment, frac=0.5):
+    arr = np.array(segment, dtype=float).copy()
+    if len(arr) <= 2:
+        return arr
+    step = abs(arr[-1] - arr[0]) / max(1, len(arr) - 1)
+    amp = frac * step
+    eps = step * 1e-6 + 1e-15
+    increasing = arr[-1] >= arr[0]
+    for i in range(1, len(arr)-1):
+        trial = arr[i] + np.random.uniform(-amp, amp)
+        lo = arr[i-1] + eps if increasing else arr[i+1] + eps
+        hi = arr[i+1] - eps if increasing else arr[i-1] - eps
+        if lo > hi:
+            lo, hi = hi, lo
+        arr[i] = min(max(trial, lo), hi)
+    return arr
+
+def _iv2_apply_exactvaluevariation(levels_si, steps_per_half, frac=0.5):
+    n = max(1, int(steps_per_half))
+    arr = np.array(levels_si, dtype=float)
+    if len(arr) != (3*n + 1):
+        return levels_si
+    seg1 = _iv2_monotonic_jitter(arr[0:n+1], frac=frac)
+    seg2 = _iv2_monotonic_jitter(arr[n:2*n+1], frac=frac)
+    seg3 = _iv2_monotonic_jitter(arr[2*n:3*n+1], frac=frac)
+    merged = np.concatenate([seg1, seg2[1:], seg3[1:]])
+    merged[0] = arr[0]
+    merged[n] = arr[n]
+    merged[2*n] = arr[2*n]
+    merged[-1] = arr[-1]
+    return list(merged)
+
 # ---------- GUI ----------
 def IV_Sweeps_NewMode():
     """
@@ -6976,7 +7020,12 @@ def TempSweepIV():
 
     tk.Label(iv_frame, text="Sweep path: 0 → Max → 0 → -Max → 0").grid(row=4, column=0, columnspan=4, sticky='w', padx=4)
     stop5k = tk.IntVar(value=1)
+    exactvariation = tk.IntVar(value=0)
     tk.Checkbutton(win, text='Fast cooldown above 5K', variable=stop5k).pack(anchor='w', padx=12)
+    tk.Checkbutton(win, text='Setpoint-Jitter (±50%)', variable=exactvariation).pack(anchor='w', padx=12)
+
+    swap_axes = tk.IntVar(value=0)
+    tk.Checkbutton(win, text='Swap axes (Voltage on X)', variable=swap_axes).pack(anchor='w', padx=12)
     progress_var = tk.DoubleVar(value=0.0)
     progress = ttk.Progressbar(win, variable=progress_var, maximum=100.0)
     progress.pack(fill=tk.X, padx=10, pady=(2, 2))
@@ -7037,10 +7086,11 @@ def TempSweepIV():
         return f"{t_lo:.4g}K-{t_hi:.4g}K"
 
     def _save_curve_incremental(base_dir, smu_name, idx, xs, ys, temp_now, user_base, t_start, t_end):
-        os.makedirs(base_dir, exist_ok=True)
+        smu_dir = os.path.join(base_dir, smu_name)
+        os.makedirs(smu_dir, exist_ok=True)
         range_tag = _fmt_temp_range(t_start, t_end)
         stamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
-        single_path = os.path.join(base_dir, f"{user_base}_{smu_name}_{range_tag}_{stamp}_curve_{idx:05d}.txt")
+        single_path = os.path.join(smu_dir, f"{user_base}_{smu_name}_{range_tag}_{stamp}_curve_{idx:05d}.txt")
         table = np.column_stack([np.array(xs, dtype=float), np.array(ys, dtype=float), np.full(len(xs), float(temp_now))])
         np.savetxt(single_path, table, fmt="%.9e", delimiter='\t', header="Current[A]\tVoltage[V]\tTemperature[K]", comments='')
 
@@ -7049,7 +7099,10 @@ def TempSweepIV():
             if not use_smu1.get() and not use_smu2.get():
                 raise ValueError("Please select at least one SMU.")
             mode = mode_var.get()
-            levels = _iv2_make_setpoints(mode, float(max_entry.get()), int(steps_entry.get()), cyclic_back_to_zero=True)
+            steps_half = int(steps_entry.get())
+            levels = _iv2_make_setpoints_tempsweep(mode, float(max_entry.get()), steps_half)
+            if exactvariation.get():
+                levels = _iv2_apply_exactvaluevariation(levels, steps_half, frac=0.5)
             wait_between_curves_s = max(0.0, float(wait_entry.get() or 0.0))
             nplc_txt = nplc_entry.get()
             comp_v_txt = comp_v_entry.get()
@@ -7149,8 +7202,14 @@ def TempSweepIV():
                             _save_curve_incremental(run_folder_primary, "SMU1", curve_idx['SMU1'], xs, ys, T_now, base_smu1, section_start_t, target_t)
                             _save_curve_incremental(run_folder_backup, "SMU1", curve_idx['SMU1'], xs, ys, T_now, base_smu1, section_start_t, target_t)
                             if cur_ax is not None:
-                                cur_ax.clear(); cur_ax.plot(xs, ys, '-o', color='black', markersize=2); cur_ax.set_xlabel('Current(A)'); cur_ax.set_ylabel('Voltage(V)'); cur_ax.set_title(f'Current IV Curve @ {T_now:.3f}K SMU1'); cur_fig.canvas.draw_idle()
-                                c = cmap(min(1.0, max(0.0, T_now/300.0))); smu1_ax.plot(xs, ys, '-', color=c, alpha=0.9); smu1_fig.canvas.draw_idle()
+                                if swap_axes.get():
+                                    px, py = ys, xs
+                                    xl, yl = 'Voltage(V)', 'Current(A)'
+                                else:
+                                    px, py = xs, ys
+                                    xl, yl = 'Current(A)', 'Voltage(V)'
+                                cur_ax.clear(); cur_ax.scatter(px, py, s=10, c='black'); cur_ax.set_xlabel(xl); cur_ax.set_ylabel(yl); cur_ax.set_title(f'Current IV Curve @ {T_now:.3f}K SMU1'); cur_fig.canvas.draw_idle()
+                                c = cmap(min(1.0, max(0.0, T_now/300.0))); smu1_ax.scatter(px, py, s=8, color=c, alpha=0.9); smu1_ax.set_xlabel(xl); smu1_ax.set_ylabel(yl); smu1_fig.canvas.draw_idle()
                             alt['next'] = 2
                             if wait_between_curves_s > 0: time.sleep(wait_between_curves_s)
                         else:
@@ -7159,8 +7218,14 @@ def TempSweepIV():
                             _save_curve_incremental(run_folder_primary, "SMU2", curve_idx['SMU2'], xs, ys, T_now, base_smu2, section_start_t, target_t)
                             _save_curve_incremental(run_folder_backup, "SMU2", curve_idx['SMU2'], xs, ys, T_now, base_smu2, section_start_t, target_t)
                             if cur_ax is not None:
-                                cur_ax.clear(); cur_ax.plot(xs, ys, '-o', color='black', markersize=2); cur_ax.set_xlabel('Current(A)'); cur_ax.set_ylabel('Voltage(V)'); cur_ax.set_title(f'Current IV Curve @ {T_now:.3f}K SMU2'); cur_fig.canvas.draw_idle()
-                                c = cmap(min(1.0, max(0.0, T_now/300.0))); smu2_ax.plot(xs, ys, '-', color=c, alpha=0.9); smu2_fig.canvas.draw_idle()
+                                if swap_axes.get():
+                                    px, py = ys, xs
+                                    xl, yl = 'Voltage(V)', 'Current(A)'
+                                else:
+                                    px, py = xs, ys
+                                    xl, yl = 'Current(A)', 'Voltage(V)'
+                                cur_ax.clear(); cur_ax.scatter(px, py, s=10, c='black'); cur_ax.set_xlabel(xl); cur_ax.set_ylabel(yl); cur_ax.set_title(f'Current IV Curve @ {T_now:.3f}K SMU2'); cur_fig.canvas.draw_idle()
+                                c = cmap(min(1.0, max(0.0, T_now/300.0))); smu2_ax.scatter(px, py, s=8, color=c, alpha=0.9); smu2_ax.set_xlabel(xl); smu2_ax.set_ylabel(yl); smu2_fig.canvas.draw_idle()
                             alt['next'] = 1
                             if wait_between_curves_s > 0: time.sleep(wait_between_curves_s)
                     elif use_smu1.get():
@@ -7201,7 +7266,7 @@ def TempSweepIV():
 
             progress_var.set(100.0)
             eta_label.config(text="Progress: 100.0% | ETA: 00:00:00")
-            status.config(text=f"Done. Incremental files in: {run_folder_primary}")
+            status.config(text=f"Done. Incremental files in: {run_folder_primary}/SMU1 and/or SMU2")
         except Exception as ex:
             status.config(text=f"Error: {ex}")
         finally:
