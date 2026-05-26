@@ -7288,13 +7288,13 @@ def TempSweepIV():
 
                 if rt1 is not None and len(rt1.data) > 0:
                     new_rows_1 = rt1.data[saved_rows['SMU1']:]
-                    if new_rows_1:
+                    if len(new_rows_1) > 0:
                         d1 = np.array([[ts] + list(map(float, vals)) for ts, *vals in new_rows_1], dtype=object)
                         safe_file(d1, f"{base_smu1}_SMU1_{range_tag}")
                         saved_rows['SMU1'] = len(rt1.data)
                 if rt2l is not None and len(rt2l.data) > 0:
                     new_rows_2 = rt2l.data[saved_rows['SMU2']:]
-                    if new_rows_2:
+                    if len(new_rows_2) > 0:
                         d2 = np.array([[ts] + list(map(float, vals)) for ts, *vals in new_rows_2], dtype=object)
                         safe_file(d2, f"{base_smu2}_SMU2_{range_tag}")
                         saved_rows['SMU2'] = len(rt2l.data)
