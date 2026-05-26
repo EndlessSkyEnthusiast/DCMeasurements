@@ -6901,12 +6901,32 @@ def TempSweepIV():
     top_opts.pack(padx=10, pady=(10, 0), fill='x')
     use_smu1 = tk.IntVar(value=1); use_smu2 = tk.IntVar(value=1)
     smu1_4wire = tk.IntVar(value=1); smu2_4wire = tk.IntVar(value=1)
-    tk.Checkbutton(top_opts, text="Use SMU1", variable=use_smu1).grid(row=0, column=0, sticky='w', padx=4)
-    tk.Label(top_opts, text="--- 2Point").grid(row=0, column=1, sticky='e', padx=(4, 2))
-    tk.Checkbutton(top_opts, text="4Point", variable=smu1_4wire).grid(row=0, column=2, sticky='w', padx=(2, 10))
-    tk.Checkbutton(top_opts, text="Use SMU2", variable=use_smu2).grid(row=1, column=0, sticky='w', padx=4)
-    tk.Label(top_opts, text="--- 2Point").grid(row=1, column=1, sticky='e', padx=(4, 2))
-    tk.Checkbutton(top_opts, text="4Point", variable=smu2_4wire).grid(row=1, column=2, sticky='w', padx=(2, 10))
+    def _add_mode_switch(parent, row, name, use_var, mode_var):
+        tk.Checkbutton(parent, text=f"Use {name}", variable=use_var).grid(row=row, column=0, sticky='w', padx=4)
+        mode_frame = tk.Frame(parent, bd=1, relief=tk.GROOVE)
+        mode_frame.grid(row=row, column=1, columnspan=2, sticky='w', padx=(4, 10))
+        tk.Label(mode_frame, text="Mode:").pack(side=tk.LEFT, padx=(6, 4))
+        b2 = tk.Button(mode_frame, text="2 Point", width=10, command=lambda: mode_var.set(0))
+        b4 = tk.Button(mode_frame, text="4 Point", width=10, command=lambda: mode_var.set(1))
+        b2.pack(side=tk.LEFT, padx=(0, 2), pady=2)
+        b4.pack(side=tk.LEFT, padx=(0, 6), pady=2)
+
+        def _refresh(*_):
+            active_bg = '#2b7cff'
+            active_fg = 'white'
+            normal_bg = win.cget('bg')
+            if mode_var.get() == 0:
+                b2.config(relief=tk.SUNKEN, bg=active_bg, fg=active_fg)
+                b4.config(relief=tk.RAISED, bg=normal_bg, fg='black')
+            else:
+                b4.config(relief=tk.SUNKEN, bg=active_bg, fg=active_fg)
+                b2.config(relief=tk.RAISED, bg=normal_bg, fg='black')
+
+        mode_var.trace_add('write', _refresh)
+        _refresh()
+
+    _add_mode_switch(top_opts, row=0, name="SMU1", use_var=use_smu1, mode_var=smu1_4wire)
+    _add_mode_switch(top_opts, row=1, name="SMU2", use_var=use_smu2, mode_var=smu2_4wire)
 
     iv_frame = ttk.LabelFrame(win, text="IV Sweep Settings (like IV Sweeps)")
     iv_frame.pack(padx=10, pady=8, fill='x')
