@@ -7087,7 +7087,7 @@ def TempSweepIV():
         return f"{t_lo:.4g}K-{t_hi:.4g}K"
 
     def _save_curve_incremental(base_dir, smu_name, idx, times, xs, ys, temp_now, user_base, t_start, t_end):
-        smu_dir = os.path.join(base_dir, smu_name)
+        smu_dir = os.path.join(base_dir, user_base)
         os.makedirs(smu_dir, exist_ok=True)
         range_tag = _fmt_temp_range(t_start, t_end)
         stamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -7136,6 +7136,8 @@ def TempSweepIV():
             cur_w, cur_fig, cur_ax = None, None, None
             smu1_w, smu1_fig, smu1_ax = None, None, None
             smu2_w, smu2_fig, smu2_ax = None, None, None
+            smu1_cbar, smu2_cbar = None, None
+            temp_min_seen, temp_max_seen = None, None
             if use_smu1.get() and use_smu2.get():
                 cur_w, cur_fig, cur_ax, _ = create_plot_window_for_Voltage_Current("TempSweepIV - Current Curve")
                 smu1_w, smu1_fig, smu1_ax, _ = create_plot_window_for_Voltage_Current("TempSweepIV - All Curves SMU1")
@@ -7143,6 +7145,38 @@ def TempSweepIV():
                 smu1_ax.set_title("All IV Curves - SMU1 (colored by T)")
                 smu2_ax.set_title("All IV Curves - SMU2 (colored by T)")
                 cur_ax.set_title("Current IV Curve")
+                if smu1_ax.get_legend() is not None:
+                    smu1_ax.get_legend().remove()
+                if smu2_ax.get_legend() is not None:
+                    smu2_ax.get_legend().remove()
+
+            def _update_temp_colors():
+                nonlocal smu1_cbar, smu2_cbar, temp_min_seen, temp_max_seen
+                if temp_min_seen is None or temp_max_seen is None:
+                    return
+                t_lo = float(temp_min_seen)
+                t_hi = float(temp_max_seen)
+                if t_hi <= t_lo:
+                    t_hi = t_lo + 1e-9
+                norm = mcolors.Normalize(vmin=t_lo, vmax=t_hi)
+                if smu1_ax is not None:
+                    for coll in smu1_ax.collections:
+                        coll.set_norm(norm)
+                    if smu1_cbar is None:
+                        smu1_cbar = smu1_fig.colorbar(cm.ScalarMappable(norm=norm, cmap=cmap), ax=smu1_ax)
+                        smu1_cbar.set_label("Temperature [K]")
+                    else:
+                        smu1_cbar.update_normal(cm.ScalarMappable(norm=norm, cmap=cmap))
+                    smu1_fig.canvas.draw_idle()
+                if smu2_ax is not None:
+                    for coll in smu2_ax.collections:
+                        coll.set_norm(norm)
+                    if smu2_cbar is None:
+                        smu2_cbar = smu2_fig.colorbar(cm.ScalarMappable(norm=norm, cmap=cmap), ax=smu2_ax)
+                        smu2_cbar.set_label("Temperature [K]")
+                    else:
+                        smu2_cbar.update_normal(cm.ScalarMappable(norm=norm, cmap=cmap))
+                    smu2_fig.canvas.draw_idle()
 
             start_now = float(client.query('T_sample.kelvin') or 300.0)
             planned_section_starts = [start_now]
@@ -7210,7 +7244,11 @@ def TempSweepIV():
                                     px, py = xs, ys
                                     xl, yl = 'Current(A)', 'Voltage(V)'
                                 cur_ax.clear(); cur_ax.scatter(px, py, s=10, c='black'); cur_ax.set_xlabel(xl); cur_ax.set_ylabel(yl); cur_ax.set_title(f'Current IV Curve @ {T_now:.3f}K SMU1'); cur_fig.canvas.draw_idle()
-                                c = cmap(min(1.0, max(0.0, T_now/300.0))); smu1_ax.scatter(px, py, s=8, color=c, alpha=0.9); smu1_ax.set_xlabel(xl); smu1_ax.set_ylabel(yl); smu1_fig.canvas.draw_idle()
+                                temp_min_seen = T_now if temp_min_seen is None else min(temp_min_seen, T_now)
+                                temp_max_seen = T_now if temp_max_seen is None else max(temp_max_seen, T_now)
+                                smu1_ax.scatter(px, py, s=8, c=[T_now], cmap=cmap, alpha=0.9)
+                                smu1_ax.set_xlabel(xl); smu1_ax.set_ylabel(yl)
+                                _update_temp_colors()
                             alt['next'] = 2
                             if wait_between_curves_s > 0: time.sleep(wait_between_curves_s)
                         else:
@@ -7226,7 +7264,11 @@ def TempSweepIV():
                                     px, py = xs, ys
                                     xl, yl = 'Current(A)', 'Voltage(V)'
                                 cur_ax.clear(); cur_ax.scatter(px, py, s=10, c='black'); cur_ax.set_xlabel(xl); cur_ax.set_ylabel(yl); cur_ax.set_title(f'Current IV Curve @ {T_now:.3f}K SMU2'); cur_fig.canvas.draw_idle()
-                                c = cmap(min(1.0, max(0.0, T_now/300.0))); smu2_ax.scatter(px, py, s=8, color=c, alpha=0.9); smu2_ax.set_xlabel(xl); smu2_ax.set_ylabel(yl); smu2_fig.canvas.draw_idle()
+                                temp_min_seen = T_now if temp_min_seen is None else min(temp_min_seen, T_now)
+                                temp_max_seen = T_now if temp_max_seen is None else max(temp_max_seen, T_now)
+                                smu2_ax.scatter(px, py, s=8, c=[T_now], cmap=cmap, alpha=0.9)
+                                smu2_ax.set_xlabel(xl); smu2_ax.set_ylabel(yl)
+                                _update_temp_colors()
                             alt['next'] = 1
                             if wait_between_curves_s > 0: time.sleep(wait_between_curves_s)
                     elif use_smu1.get():
@@ -7267,7 +7309,7 @@ def TempSweepIV():
 
             progress_var.set(100.0)
             eta_label.config(text="Progress: 100.0% | ETA: 00:00:00")
-            status.config(text=f"Done. Incremental files in: {run_folder_primary}/SMU1 and/or SMU2")
+            status.config(text=f"Done. Incremental files in: {run_folder_primary}/{base_smu1} and/or {run_folder_primary}/{base_smu2}")
         except Exception as ex:
             status.config(text=f"Error: {ex}")
         finally:
