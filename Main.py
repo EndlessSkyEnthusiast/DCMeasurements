@@ -6619,9 +6619,11 @@ def IV_Sweeps_NewMode():
 
     # Mode toggle
     mode_var = tk.StringVar(value='I')  # 'I' current (µA), 'V' voltage (mV)
+    iv_fourpt_var = tk.BooleanVar(value=True)
     ttk.Label(frm, text="Sweep mode").grid(row=0, column=0, sticky="e", padx=4, pady=4)
     ttk.Radiobutton(frm, text="Current (µA)", variable=mode_var, value='I').grid(row=0, column=1, sticky="w")
     ttk.Radiobutton(frm, text="Voltage (mV)", variable=mode_var, value='V').grid(row=0, column=2, sticky="w")
+    ttk.Checkbutton(frm, text="4 Point (remote) / 2 Point (local)", variable=iv_fourpt_var).grid(row=0, column=3, sticky="w")
 
     # Max & steps
     ttk.Label(frm, text="Max amplitude").grid(row=1, column=0, sticky="e", padx=4, pady=4)
@@ -6691,7 +6693,10 @@ def IV_Sweeps_NewMode():
         try:
             start_btn.config(state=tk.DISABLED); stop_btn.config(state=tk.NORMAL)
             status.config(text="Configuring…")
-            _iv2_set_sense_from_var()
+            try:
+                k.smua.sense = k.smua.SENSE_REMOTE if iv_fourpt_var.get() else k.smua.SENSE_LOCAL
+            except Exception:
+                pass
             mode = mode_var.get()   # 'I' or 'V'
             max_user = float(max_entry.get())
             steps_half = int(steps_entry.get())
@@ -6892,64 +6897,112 @@ def TempSweepIV():
     win.title("TempSweepIV")
     win.protocol("WM_DELETE_WINDOW", lambda: on_closing(win))
 
-    frm = tk.Frame(win); frm.pack(padx=10, pady=10, fill=tk.X)
-    tk.Label(frm, text="Targets [K] comma-separated").grid(row=0, column=0, sticky='w')
-    temps_entry = tk.Entry(frm, width=50)
-    temps_entry.insert(0, "270,0.5")
-    temps_entry.grid(row=0, column=1, columnspan=3, padx=6)
-
+    top_opts = ttk.LabelFrame(win, text="Devices & IV Mode")
+    top_opts.pack(padx=10, pady=(10, 0), fill='x')
     use_smu1 = tk.IntVar(value=1); use_smu2 = tk.IntVar(value=1)
-    tk.Checkbutton(frm, text="Use SMU1", variable=use_smu1).grid(row=1, column=0, sticky='w')
-    tk.Checkbutton(frm, text="Use SMU2", variable=use_smu2).grid(row=1, column=1, sticky='w')
+    smu1_4wire = tk.IntVar(value=1); smu2_4wire = tk.IntVar(value=1)
+    tk.Checkbutton(top_opts, text="Use SMU1", variable=use_smu1).grid(row=0, column=0, sticky='w', padx=4)
+    tk.Checkbutton(top_opts, text="Use SMU2", variable=use_smu2).grid(row=0, column=1, sticky='w', padx=4)
+    tk.Checkbutton(top_opts, text="SMU1 4 Point (remote) / 2 Point (local)", variable=smu1_4wire).grid(row=0, column=2, sticky='w', padx=4)
+    tk.Checkbutton(top_opts, text="SMU2 4 Point (remote) / 2 Point (local)", variable=smu2_4wire).grid(row=0, column=3, sticky='w', padx=4)
+
+    iv_frame = ttk.LabelFrame(win, text="IV Sweep Settings (like IV Sweeps)")
+    iv_frame.pack(padx=10, pady=8, fill='x')
+    mode_var = tk.StringVar(value='I')
+    tk.Radiobutton(iv_frame, text="Current (µA)", variable=mode_var, value='I').grid(row=0, column=0, sticky='w')
+    tk.Radiobutton(iv_frame, text="Voltage (mV)", variable=mode_var, value='V').grid(row=0, column=1, sticky='w')
+    tk.Label(iv_frame, text="Max amplitude").grid(row=1, column=0, sticky='e')
+    max_entry = tk.Entry(iv_frame, width=10); max_entry.insert(0, "200")
+    max_entry.grid(row=1, column=1, sticky='w')
+    tk.Label(iv_frame, text="Steps per half").grid(row=1, column=2, sticky='e')
+    steps_entry = tk.Entry(iv_frame, width=10); steps_entry.insert(0, "20")
+    steps_entry.grid(row=1, column=3, sticky='w')
+
+    temp_sections = ttk.LabelFrame(win, text="Temperature Sections (like Parallel 4-point Tc)")
+    temp_sections.pack(padx=10, pady=8, fill='x')
+    section_frames = []
+    def add_temp_section():
+        fr = create_tc_frame(temp_sections)
+        fr.pack(fill=tk.X)
+        regen = tk.IntVar(value=0)
+        tk.Checkbutton(fr, text="Regenerate", variable=regen).grid(row=0, column=8)
+        fr.regenerate_var = regen
+        section_frames.append(fr)
+    add_temp_section()
+
     stop5k = tk.IntVar(value=1)
-    tk.Checkbutton(frm, text="Cooldown stop at 5K via Temperature Control", variable=stop5k).grid(row=1, column=2, columnspan=2, sticky='w')
-
-    tk.Label(frm, text="Ramp [K/min]").grid(row=2, column=0, sticky='w')
-    ramp_entry = tk.Entry(frm, width=10); ramp_entry.insert(0, "2")
-    ramp_entry.grid(row=2, column=1, sticky='w')
-
-    tk.Label(frm, text="Measure interval [s]").grid(row=2, column=2, sticky='e')
-    dt_entry = tk.Entry(frm, width=10); dt_entry.insert(0, "0.3")
-    dt_entry.grid(row=2, column=3, sticky='w')
-
+    tk.Checkbutton(win, text="Cooldown stop at 5K via Temperature Control", variable=stop5k).pack(anchor='w', padx=12)
     status = tk.Label(win, text="Ready")
-    status.pack(fill=tk.X, padx=10, pady=(0, 10))
+    status.pack(fill=tk.X, padx=10, pady=6)
 
-    def _drive_temperature(target, ramp):
-        now = float(client.query('T_sample.kelvin') or 300.0)
-        if target > 3.0 or now > 3.0:
-            try: adr_control.stop_adr()
-            except Exception: pass
-            temperature_control.start((target, ramp))
-        else:
-            try: temperature_control.stop()
-            except Exception: pass
-            adr_control.start_adr(setpoint=target, ramp=ramp, adr_mode=None, operation_mode='cadr', auto_regenerate=True, pre_regenerate=False)
+    def _set_sense(dev, is4):
+        try: dev.smua.sense = dev.smua.SENSE_REMOTE if is4 else dev.smua.SENSE_LOCAL
+        except Exception: pass
+
+    def _apply_level(dev, mode, level_si):
+        try:
+            dev.smua.source.output = 1
+            dev.smua.source.func = 2 if mode == 'I' else 1
+            if mode == 'I': dev.smua.source.leveli = level_si
+            else: dev.smua.source.levelv = level_si
+        except Exception:
+            pass
+
+    def _measure_curve(dev, mode, levels_si, rt_obj, temp_now):
+        for L in levels_si:
+            _apply_level(dev, mode, L)
+            time.sleep(0.02)
+            meas = float(dev.smua.measure.v()) if mode == 'I' else float(dev.smua.measure.i())
+            ts = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            rt_obj.append_row([ts, L if mode == 'I' else meas, meas if mode == 'I' else L, temp_now])
 
     def _run():
         try:
-            targets = _parse_temperature_list(temps_entry.get())
-            ramp = float(ramp_entry.get())
-            dt = float(dt_entry.get())
-            if not targets:
-                raise ValueError("No temperature targets provided")
+            if not use_smu1.get() and not use_smu2.get():
+                raise ValueError("Please select at least one SMU.")
+            mode = mode_var.get()
+            levels = _iv2_make_setpoints(mode, float(max_entry.get()), int(steps_entry.get()), cyclic_back_to_zero=True)
+            sections = []
+            for fr in section_frames:
+                w = fr.winfo_children()
+                sections.append((float(w[1].get()), float(w[3].get()), float(w[5].get()), int(fr.regenerate_var.get())))
 
+            if use_smu1.get(): _set_sense(k, bool(smu1_4wire.get()))
+            if use_smu2.get(): _set_sense(k2, bool(smu2_4wire.get()))
             rt1 = ResultTable(column_titles=['Time','Current [A]','Voltage[V]','Temperature[K]'], units=[' ','A','V','K'], params={'recorded': time.asctime(), 'sweep_type': 'tempsweepiv'}) if use_smu1.get() else None
             rt2l = ResultTable(column_titles=['Time','Current [A]','Voltage[V]','Temperature[K]'], units=[' ','A','V','K'], params={'recorded': time.asctime(), 'sweep_type': 'tempsweepiv'}) if use_smu2.get() else None
             alt = {'next': 1}
 
-            for tgt in targets:
-                status.config(text=f"Driving to {tgt} K")
-                _drive_temperature(tgt, ramp)
-                while abs(float(client.query('T_sample.kelvin') or 300.0) - tgt) > (0.05 if tgt > 3 else 0.02):
+            for start_t, end_t, ramp, regen in sections:
+                if start_t > 3.0:
+                    temperature_control.start((start_t, ramp))
+                else:
+                    adr_control.start_adr(setpoint=start_t, ramp=ramp, adr_mode=None, operation_mode='cadr', auto_regenerate=True, pre_regenerate=bool(regen))
+                while abs(float(client.query('T_sample.kelvin') or 300.0) - start_t) > 0.1:
+                    time.sleep(0.2)
+
+                if end_t > 3.0:
+                    temperature_control.start((end_t, ramp))
+                else:
+                    try: temperature_control.stop()
+                    except Exception: pass
+                    adr_control.start_adr(setpoint=end_t, ramp=ramp, adr_mode=None, operation_mode='cadr', auto_regenerate=True, pre_regenerate=bool(regen))
+
+                while abs(float(client.query('T_sample.kelvin') or 300.0) - end_t) > (0.05 if end_t > 3 else 0.02):
                     T_now = float(client.query('T_sample.kelvin') or 300.0)
-                    ts = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                    _measure_selected_smus_alternating(bool(use_smu1.get()), bool(use_smu2.get()), alt, 1, T_now, ts, rt_obj=rt1, rt2_obj=rt2l)
-                    time.sleep(max(0.05, dt))
+                    status.config(text=f"T={T_now:.3f} K -> {end_t:.3f} K")
+                    if use_smu1.get() and use_smu2.get():
+                        if alt['next'] == 1:
+                            _measure_curve(k, mode, levels, rt1, T_now); alt['next'] = 2
+                        else:
+                            _measure_curve(k2, mode, levels, rt2l, T_now); alt['next'] = 1
+                    elif use_smu1.get():
+                        _measure_curve(k, mode, levels, rt1, T_now)
+                    elif use_smu2.get():
+                        _measure_curve(k2, mode, levels, rt2l, T_now)
 
             if stop5k.get():
-                status.config(text="Temperature Control Stop -> 5K")
-                temperature_control.start((5.0, ramp))
+                temperature_control.start((5.0, 5.0))
                 while abs(float(client.query('T_sample.kelvin') or 300.0) - 5.0) > 0.1:
                     time.sleep(0.2)
                 try: temperature_control.stop()
@@ -6957,19 +7010,23 @@ def TempSweepIV():
 
             base = simpledialog.askstring("Filename", "Base filename for TempSweepIV:") or "TempSweepIV"
             if rt1 is not None:
-                d1 = np.array([[ts] + list(map(float, vals)) for ts, *vals in rt1.data], dtype=object)
-                safe_file(d1, base + "_SMU1")
+                d1 = np.array([[ts] + list(map(float, vals)) for ts, *vals in rt1.data], dtype=object); safe_file(d1, base + "_SMU1")
             if rt2l is not None:
-                d2 = np.array([[ts] + list(map(float, vals)) for ts, *vals in rt2l.data], dtype=object)
-                safe_file(d2, base + "_SMU2")
+                d2 = np.array([[ts] + list(map(float, vals)) for ts, *vals in rt2l.data], dtype=object); safe_file(d2, base + "_SMU2")
             status.config(text="Done")
         except Exception as ex:
             status.config(text=f"Error: {ex}")
         finally:
+            try: k.smua.source.output = 0
+            except Exception: pass
+            try: k2.smua.source.output = 0
+            except Exception: pass
             global measurement
             measurement = 0
 
-    tk.Button(win, text="Start TempSweepIV", command=lambda: threading.Thread(target=_run, daemon=True).start()).pack(pady=(0,10))
+    ctl = tk.Frame(win); ctl.pack(fill=tk.X, padx=10, pady=8)
+    tk.Button(ctl, text="Add Temp Section", command=add_temp_section).pack(side=tk.LEFT)
+    tk.Button(ctl, text="Start TempSweepIV", command=lambda: threading.Thread(target=_run, daemon=True).start()).pack(side=tk.RIGHT)
     return win
 
 #%% Cell 15: MAIN
