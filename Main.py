@@ -7068,7 +7068,7 @@ def TempSweepIV():
             pass
 
     def _measure_curve(dev, mode, levels_si, rt_obj, temp_now):
-        xs, ys = [], []
+        xs, ys, times = [], [], []
         for L in levels_si:
             _apply_level(dev, mode, L)
             time.sleep(0.02)
@@ -7077,22 +7077,23 @@ def TempSweepIV():
             v_val = meas if mode == 'I' else L
             ts = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
             rt_obj.append_row([ts, i_val, v_val, temp_now])
+            times.append(ts)
             xs.append(i_val); ys.append(v_val)
-        return xs, ys
+        return times, xs, ys
 
     def _fmt_temp_range(t_start, t_end):
         t_lo = min(float(t_start), float(t_end))
         t_hi = max(float(t_start), float(t_end))
         return f"{t_lo:.4g}K-{t_hi:.4g}K"
 
-    def _save_curve_incremental(base_dir, smu_name, idx, xs, ys, temp_now, user_base, t_start, t_end):
+    def _save_curve_incremental(base_dir, smu_name, idx, times, xs, ys, temp_now, user_base, t_start, t_end):
         smu_dir = os.path.join(base_dir, smu_name)
         os.makedirs(smu_dir, exist_ok=True)
         range_tag = _fmt_temp_range(t_start, t_end)
         stamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
         single_path = os.path.join(smu_dir, f"{user_base}_{smu_name}_{range_tag}_{stamp}_curve_{idx:05d}.txt")
-        table = np.column_stack([np.array(xs, dtype=float), np.array(ys, dtype=float), np.full(len(xs), float(temp_now))])
-        np.savetxt(single_path, table, fmt="%.9e", delimiter='\t', header="Current[A]\tVoltage[V]\tTemperature[K]", comments='')
+        table = np.column_stack([np.array(times, dtype=object), np.array(xs, dtype=float), np.array(ys, dtype=float), np.full(len(xs), float(temp_now))])
+        np.savetxt(single_path, table, fmt=['%s','%.9e','%.9e','%.9e'], delimiter='\t', header="Time\tCurrent[A]\tVoltage[V]\tTemperature[K]", comments='')
 
     def _run(base_smu1, base_smu2):
         try:
@@ -7197,10 +7198,10 @@ def TempSweepIV():
                     status.config(text=f"T={T_now:.3f} K -> {target_t:.3f} K")
                     if use_smu1.get() and use_smu2.get():
                         if alt['next'] == 1:
-                            xs, ys = xs, ys = _measure_curve(k, mode, levels, rt1, T_now)
+                            times, xs, ys = _measure_curve(k, mode, levels, rt1, T_now)
                             curve_idx['SMU1'] += 1
-                            _save_curve_incremental(run_folder_primary, "SMU1", curve_idx['SMU1'], xs, ys, T_now, base_smu1, section_start_t, target_t)
-                            _save_curve_incremental(run_folder_backup, "SMU1", curve_idx['SMU1'], xs, ys, T_now, base_smu1, section_start_t, target_t)
+                            _save_curve_incremental(run_folder_primary, "SMU1", curve_idx['SMU1'], times, xs, ys, T_now, base_smu1, section_start_t, target_t)
+                            _save_curve_incremental(run_folder_backup, "SMU1", curve_idx['SMU1'], times, xs, ys, T_now, base_smu1, section_start_t, target_t)
                             if cur_ax is not None:
                                 if swap_axes.get():
                                     px, py = ys, xs
@@ -7213,10 +7214,10 @@ def TempSweepIV():
                             alt['next'] = 2
                             if wait_between_curves_s > 0: time.sleep(wait_between_curves_s)
                         else:
-                            xs, ys = xs, ys = _measure_curve(k2, mode, levels, rt2l, T_now)
+                            times, xs, ys = _measure_curve(k2, mode, levels, rt2l, T_now)
                             curve_idx['SMU2'] += 1
-                            _save_curve_incremental(run_folder_primary, "SMU2", curve_idx['SMU2'], xs, ys, T_now, base_smu2, section_start_t, target_t)
-                            _save_curve_incremental(run_folder_backup, "SMU2", curve_idx['SMU2'], xs, ys, T_now, base_smu2, section_start_t, target_t)
+                            _save_curve_incremental(run_folder_primary, "SMU2", curve_idx['SMU2'], times, xs, ys, T_now, base_smu2, section_start_t, target_t)
+                            _save_curve_incremental(run_folder_backup, "SMU2", curve_idx['SMU2'], times, xs, ys, T_now, base_smu2, section_start_t, target_t)
                             if cur_ax is not None:
                                 if swap_axes.get():
                                     px, py = ys, xs
@@ -7229,16 +7230,16 @@ def TempSweepIV():
                             alt['next'] = 1
                             if wait_between_curves_s > 0: time.sleep(wait_between_curves_s)
                     elif use_smu1.get():
-                        xs, ys = _measure_curve(k, mode, levels, rt1, T_now)
+                        times, xs, ys = _measure_curve(k, mode, levels, rt1, T_now)
                         curve_idx['SMU1'] += 1
-                        _save_curve_incremental(run_folder_primary, "SMU1", curve_idx['SMU1'], xs, ys, T_now, base_smu1, section_start_t, target_t)
-                        _save_curve_incremental(run_folder_backup, "SMU1", curve_idx['SMU1'], xs, ys, T_now, base_smu1, section_start_t, target_t)
+                        _save_curve_incremental(run_folder_primary, "SMU1", curve_idx['SMU1'], times, xs, ys, T_now, base_smu1, section_start_t, target_t)
+                        _save_curve_incremental(run_folder_backup, "SMU1", curve_idx['SMU1'], times, xs, ys, T_now, base_smu1, section_start_t, target_t)
                         if wait_between_curves_s > 0: time.sleep(wait_between_curves_s)
                     elif use_smu2.get():
-                        xs, ys = _measure_curve(k2, mode, levels, rt2l, T_now)
+                        times, xs, ys = _measure_curve(k2, mode, levels, rt2l, T_now)
                         curve_idx['SMU2'] += 1
-                        _save_curve_incremental(run_folder_primary, "SMU2", curve_idx['SMU2'], xs, ys, T_now, base_smu2, section_start_t, target_t)
-                        _save_curve_incremental(run_folder_backup, "SMU2", curve_idx['SMU2'], xs, ys, T_now, base_smu2, section_start_t, target_t)
+                        _save_curve_incremental(run_folder_primary, "SMU2", curve_idx['SMU2'], times, xs, ys, T_now, base_smu2, section_start_t, target_t)
+                        _save_curve_incremental(run_folder_backup, "SMU2", curve_idx['SMU2'], times, xs, ys, T_now, base_smu2, section_start_t, target_t)
                         if wait_between_curves_s > 0: time.sleep(wait_between_curves_s)
 
                 if rt1 is not None and rt1.data:
