@@ -7136,29 +7136,32 @@ def TempSweepIV():
             os.makedirs(run_folder_primary, exist_ok=True)
             os.makedirs(run_folder_backup, exist_ok=True)
 
-            # Plot windows: if both SMUs selected => current curve + all SMU1 + all SMU2
+            # Plot windows: current curve (if both selected) + all-curves windows for selected SMUs
             cmap = plt.cm.plasma
             cur_w, cur_fig, cur_ax = None, None, None
             smu1_w, smu1_fig, smu1_ax = None, None, None
             smu2_w, smu2_fig, smu2_ax = None, None, None
             smu1_cbar = None
             smu2_cbar = None
+            smu1_sm = None
+            smu2_sm = None
+            if use_smu1.get():
+                smu1_w, smu1_fig, smu1_ax, _ = create_plot_window_for_Voltage_Current("TempSweepIV - All Curves SMU1")
+                smu1_ax.set_title("All IV Curves - SMU1 (colored by T)")
+            if use_smu2.get():
+                smu2_w, smu2_fig, smu2_ax, _ = create_plot_window_for_Voltage_Current("TempSweepIV - All Curves SMU2")
+                smu2_ax.set_title("All IV Curves - SMU2 (colored by T)")
             if use_smu1.get() and use_smu2.get():
                 cur_w, cur_fig, cur_ax, _ = create_plot_window_for_Voltage_Current("TempSweepIV - Current Curve")
-                smu1_w, smu1_fig, smu1_ax, _ = create_plot_window_for_Voltage_Current("TempSweepIV - All Curves SMU1")
-                smu2_w, smu2_fig, smu2_ax, _ = create_plot_window_for_Voltage_Current("TempSweepIV - All Curves SMU2")
-                smu1_ax.set_title("All IV Curves - SMU1 (colored by T)")
-                smu2_ax.set_title("All IV Curves - SMU2 (colored by T)")
                 cur_ax.set_title("Current IV Curve")
-                try:
-                    leg = smu1_ax.get_legend()
-                    if leg is not None:
-                        leg.remove()
-                    leg = smu2_ax.get_legend()
-                    if leg is not None:
-                        leg.remove()
-                except Exception:
-                    pass
+            for ax in (smu1_ax, smu2_ax):
+                if ax is not None:
+                    try:
+                        leg = ax.get_legend()
+                        if leg is not None:
+                            leg.remove()
+                    except Exception:
+                        pass
 
             start_now = float(client.query('T_sample.kelvin') or 300.0)
             planned_section_starts = [start_now]
@@ -7191,6 +7194,20 @@ def TempSweepIV():
                 if abs(t_max - t_min) < 1e-9:
                     t_max = t_min + 1e-9
                 sec_norm = mcolors.Normalize(vmin=t_min, vmax=t_max)
+                if smu1_ax is not None:
+                    if smu1_cbar is not None:
+                        smu1_cbar.remove()
+                    smu1_sm = plt.cm.ScalarMappable(norm=sec_norm, cmap=cmap)
+                    smu1_sm.set_array([])
+                    smu1_cbar = smu1_fig.colorbar(smu1_sm, ax=smu1_ax, pad=0.02)
+                    smu1_cbar.set_label('Temperature [K]')
+                if smu2_ax is not None:
+                    if smu2_cbar is not None:
+                        smu2_cbar.remove()
+                    smu2_sm = plt.cm.ScalarMappable(norm=sec_norm, cmap=cmap)
+                    smu2_sm.set_array([])
+                    smu2_cbar = smu2_fig.colorbar(smu2_sm, ax=smu2_ax, pad=0.02)
+                    smu2_cbar.set_label('Temperature [K]')
 
                 while abs(float(client.query('T_sample.kelvin') or 300.0) - target_t) > (0.05 if target_t > 3 else 0.02):
                     T_now = float(client.query('T_sample.kelvin') or 300.0)
@@ -7232,14 +7249,7 @@ def TempSweepIV():
                                     px, py = xs, ys
                                     xl, yl = 'Current(A)', 'Voltage(V)'
                                 cur_ax.clear(); cur_ax.scatter(px, py, s=10, c='black'); cur_ax.set_xlabel(xl); cur_ax.set_ylabel(yl); cur_ax.set_title(f'Current IV Curve @ {T_now:.3f}K SMU1'); cur_fig.canvas.draw_idle()
-                                c = cmap(sec_norm(T_now)); smu1_ax.scatter(px, py, s=8, color=c, alpha=0.9); smu1_ax.set_xlabel(xl); smu1_ax.set_ylabel(yl);
-                                if smu1_cbar is not None:
-                                    smu1_cbar.remove()
-                                smu1_sm = plt.cm.ScalarMappable(norm=sec_norm, cmap=cmap)
-                                smu1_sm.set_array([])
-                                smu1_cbar = smu1_fig.colorbar(smu1_sm, ax=smu1_ax, pad=0.02)
-                                smu1_cbar.set_label('Temperature [K]')
-                                smu1_fig.canvas.draw_idle()
+                                c = cmap(sec_norm(T_now)); smu1_ax.scatter(px, py, s=8, color=c, alpha=0.9); smu1_ax.set_xlabel(xl); smu1_ax.set_ylabel(yl); smu1_fig.canvas.draw_idle()
                             alt['next'] = 2
                             if wait_between_curves_s > 0: time.sleep(wait_between_curves_s)
                         else:
@@ -7255,14 +7265,7 @@ def TempSweepIV():
                                     px, py = xs, ys
                                     xl, yl = 'Current(A)', 'Voltage(V)'
                                 cur_ax.clear(); cur_ax.scatter(px, py, s=10, c='black'); cur_ax.set_xlabel(xl); cur_ax.set_ylabel(yl); cur_ax.set_title(f'Current IV Curve @ {T_now:.3f}K SMU2'); cur_fig.canvas.draw_idle()
-                                c = cmap(sec_norm(T_now)); smu2_ax.scatter(px, py, s=8, color=c, alpha=0.9); smu2_ax.set_xlabel(xl); smu2_ax.set_ylabel(yl);
-                                if smu2_cbar is not None:
-                                    smu2_cbar.remove()
-                                smu2_sm = plt.cm.ScalarMappable(norm=sec_norm, cmap=cmap)
-                                smu2_sm.set_array([])
-                                smu2_cbar = smu2_fig.colorbar(smu2_sm, ax=smu2_ax, pad=0.02)
-                                smu2_cbar.set_label('Temperature [K]')
-                                smu2_fig.canvas.draw_idle()
+                                c = cmap(sec_norm(T_now)); smu2_ax.scatter(px, py, s=8, color=c, alpha=0.9); smu2_ax.set_xlabel(xl); smu2_ax.set_ylabel(yl); smu2_fig.canvas.draw_idle()
                             alt['next'] = 1
                             if wait_between_curves_s > 0: time.sleep(wait_between_curves_s)
                     elif use_smu1.get():
@@ -7270,12 +7273,28 @@ def TempSweepIV():
                         curve_idx['SMU1'] += 1
                         _save_curve_incremental(run_folder_primary, "SMU1", curve_idx['SMU1'], xs, ys, T_now, base_smu1, section_start_t, target_t)
                         _save_curve_incremental(run_folder_backup, "SMU1", curve_idx['SMU1'], xs, ys, T_now, base_smu1, section_start_t, target_t)
+                        if smu1_ax is not None:
+                            if swap_axes.get():
+                                px, py = ys, xs
+                                xl, yl = 'Voltage(V)', 'Current(A)'
+                            else:
+                                px, py = xs, ys
+                                xl, yl = 'Current(A)', 'Voltage(V)'
+                            c = cmap(sec_norm(T_now)); smu1_ax.scatter(px, py, s=8, color=c, alpha=0.9); smu1_ax.set_xlabel(xl); smu1_ax.set_ylabel(yl); smu1_fig.canvas.draw_idle()
                         if wait_between_curves_s > 0: time.sleep(wait_between_curves_s)
                     elif use_smu2.get():
                         xs, ys = _measure_curve(k2, mode, levels, rt2l, T_now)
                         curve_idx['SMU2'] += 1
                         _save_curve_incremental(run_folder_primary, "SMU2", curve_idx['SMU2'], xs, ys, T_now, base_smu2, section_start_t, target_t)
                         _save_curve_incremental(run_folder_backup, "SMU2", curve_idx['SMU2'], xs, ys, T_now, base_smu2, section_start_t, target_t)
+                        if smu2_ax is not None:
+                            if swap_axes.get():
+                                px, py = ys, xs
+                                xl, yl = 'Voltage(V)', 'Current(A)'
+                            else:
+                                px, py = xs, ys
+                                xl, yl = 'Current(A)', 'Voltage(V)'
+                            c = cmap(sec_norm(T_now)); smu2_ax.scatter(px, py, s=8, color=c, alpha=0.9); smu2_ax.set_xlabel(xl); smu2_ax.set_ylabel(yl); smu2_fig.canvas.draw_idle()
                         if wait_between_curves_s > 0: time.sleep(wait_between_curves_s)
 
                 if rt1 is not None and rt1.data:
