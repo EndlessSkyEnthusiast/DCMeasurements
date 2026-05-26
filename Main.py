@@ -7026,9 +7026,16 @@ def TempSweepIV():
             xs.append(i_val); ys.append(v_val)
         return xs, ys
 
-    def _save_curve_incremental(base_dir, smu_name, idx, xs, ys, temp_now):
+    def _fmt_temp_range(t_start, t_end):
+        t_lo = min(float(t_start), float(t_end))
+        t_hi = max(float(t_start), float(t_end))
+        return f"{t_lo:.4g}K-{t_hi:.4g}K"
+
+    def _save_curve_incremental(base_dir, smu_name, idx, xs, ys, temp_now, user_base, t_start, t_end):
         os.makedirs(base_dir, exist_ok=True)
-        single_path = os.path.join(base_dir, f"{smu_name}_curve_{idx:05d}.txt")
+        range_tag = _fmt_temp_range(t_start, t_end)
+        stamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+        single_path = os.path.join(base_dir, f"{user_base}_{smu_name}_{range_tag}_{stamp}_curve_{idx:05d}.txt")
         table = np.column_stack([np.array(xs, dtype=float), np.array(ys, dtype=float), np.full(len(xs), float(temp_now))])
         np.savetxt(single_path, table, fmt="%.9e", delimiter='\t', header="Current[A]\tVoltage[V]\tTemperature[K]", comments='')
 
@@ -7056,9 +7063,13 @@ def TempSweepIV():
             rt2l = ResultTable(column_titles=['Time','Current [A]','Voltage[V]','Temperature[K]'], units=[' ','A','V','K'], params={'recorded': time.asctime(), 'sweep_type': 'tempsweepiv'}) if use_smu2.get() else None
             alt = {'next': 1}
             curve_idx = {'SMU1': 0, 'SMU2': 0}
+            saved_rows = {'SMU1': 0, 'SMU2': 0}
             base = simpledialog.askstring("Filename", "Base filename for TempSweepIV:") or "TempSweepIV"
-            run_folder = os.path.join(SAVE_PATH_2, get_filename(base))
-            os.makedirs(run_folder, exist_ok=True)
+            run_name = get_filename(base)
+            run_folder_primary = os.path.join(SAVE_PATH, run_name)
+            run_folder_backup = os.path.join(SAVE_PATH_2, run_name)
+            os.makedirs(run_folder_primary, exist_ok=True)
+            os.makedirs(run_folder_backup, exist_ok=True)
 
             # Plot windows: if both SMUs selected => current curve + all SMU1 + all SMU2
             cmap = plt.cm.plasma
@@ -7074,7 +7085,9 @@ def TempSweepIV():
                 cur_ax.set_title("Current IV Curve")
 
             for target_t, ramp, regen in sections:
-                current_t = float(client.query('T_sample.kelvin') or 300.0)
+                section_start_t = float(client.query('T_sample.kelvin') or 300.0)
+                current_t = section_start_t
+                range_tag = _fmt_temp_range(section_start_t, target_t)
                 fast_cool_mode = bool(stop5k.get() and (target_t < current_t) and (current_t > 5.0))
                 if fast_cool_mode:
                     try:
@@ -7102,7 +7115,8 @@ def TempSweepIV():
                         if alt['next'] == 1:
                             xs, ys = xs, ys = _measure_curve(k, mode, levels, rt1, T_now)
                             curve_idx['SMU1'] += 1
-                            _save_curve_incremental(run_folder, "SMU1", curve_idx['SMU1'], xs, ys, T_now)
+                            _save_curve_incremental(run_folder_primary, "SMU1", curve_idx['SMU1'], xs, ys, T_now, base, section_start_t, target_t)
+                            _save_curve_incremental(run_folder_backup, "SMU1", curve_idx['SMU1'], xs, ys, T_now, base, section_start_t, target_t)
                             if cur_ax is not None:
                                 cur_ax.clear(); cur_ax.plot(xs, ys, '-o', color='black', markersize=2); cur_ax.set_xlabel('Current(A)'); cur_ax.set_ylabel('Voltage(V)'); cur_ax.set_title(f'Current IV Curve @ {T_now:.3f}K SMU1'); cur_fig.canvas.draw_idle()
                                 c = cmap(min(1.0, max(0.0, T_now/300.0))); smu1_ax.plot(xs, ys, '-', color=c, alpha=0.9); smu1_fig.canvas.draw_idle()
@@ -7111,7 +7125,8 @@ def TempSweepIV():
                         else:
                             xs, ys = xs, ys = _measure_curve(k2, mode, levels, rt2l, T_now)
                             curve_idx['SMU2'] += 1
-                            _save_curve_incremental(run_folder, "SMU2", curve_idx['SMU2'], xs, ys, T_now)
+                            _save_curve_incremental(run_folder_primary, "SMU2", curve_idx['SMU2'], xs, ys, T_now, base, section_start_t, target_t)
+                            _save_curve_incremental(run_folder_backup, "SMU2", curve_idx['SMU2'], xs, ys, T_now, base, section_start_t, target_t)
                             if cur_ax is not None:
                                 cur_ax.clear(); cur_ax.plot(xs, ys, '-o', color='black', markersize=2); cur_ax.set_xlabel('Current(A)'); cur_ax.set_ylabel('Voltage(V)'); cur_ax.set_title(f'Current IV Curve @ {T_now:.3f}K SMU2'); cur_fig.canvas.draw_idle()
                                 c = cmap(min(1.0, max(0.0, T_now/300.0))); smu2_ax.plot(xs, ys, '-', color=c, alpha=0.9); smu2_fig.canvas.draw_idle()
@@ -7120,13 +7135,28 @@ def TempSweepIV():
                     elif use_smu1.get():
                         xs, ys = _measure_curve(k, mode, levels, rt1, T_now)
                         curve_idx['SMU1'] += 1
-                        _save_curve_incremental(run_folder, "SMU1", curve_idx['SMU1'], xs, ys, T_now)
+                        _save_curve_incremental(run_folder_primary, "SMU1", curve_idx['SMU1'], xs, ys, T_now, base, section_start_t, target_t)
+                        _save_curve_incremental(run_folder_backup, "SMU1", curve_idx['SMU1'], xs, ys, T_now, base, section_start_t, target_t)
                         if wait_between_curves_s > 0: time.sleep(wait_between_curves_s)
                     elif use_smu2.get():
                         xs, ys = _measure_curve(k2, mode, levels, rt2l, T_now)
                         curve_idx['SMU2'] += 1
-                        _save_curve_incremental(run_folder, "SMU2", curve_idx['SMU2'], xs, ys, T_now)
+                        _save_curve_incremental(run_folder_primary, "SMU2", curve_idx['SMU2'], xs, ys, T_now, base, section_start_t, target_t)
+                        _save_curve_incremental(run_folder_backup, "SMU2", curve_idx['SMU2'], xs, ys, T_now, base, section_start_t, target_t)
                         if wait_between_curves_s > 0: time.sleep(wait_between_curves_s)
+
+                if rt1 is not None and rt1.data:
+                    new_rows_1 = rt1.data[saved_rows['SMU1']:]
+                    if new_rows_1:
+                        d1 = np.array([[ts] + list(map(float, vals)) for ts, *vals in new_rows_1], dtype=object)
+                        safe_file(d1, f"{base}_SMU1_{range_tag}")
+                        saved_rows['SMU1'] = len(rt1.data)
+                if rt2l is not None and rt2l.data:
+                    new_rows_2 = rt2l.data[saved_rows['SMU2']:]
+                    if new_rows_2:
+                        d2 = np.array([[ts] + list(map(float, vals)) for ts, *vals in new_rows_2], dtype=object)
+                        safe_file(d2, f"{base}_SMU2_{range_tag}")
+                        saved_rows['SMU2'] = len(rt2l.data)
 
             if stop5k.get():
                 cur_t = float(client.query('T_sample.kelvin') or 300.0)
@@ -7137,11 +7167,7 @@ def TempSweepIV():
                     try: temperature_control.stop()
                     except Exception: pass
 
-            if rt1 is not None:
-                d1 = np.array([[ts] + list(map(float, vals)) for ts, *vals in rt1.data], dtype=object); safe_file(d1, base + "_SMU1")
-            if rt2l is not None:
-                d2 = np.array([[ts] + list(map(float, vals)) for ts, *vals in rt2l.data], dtype=object); safe_file(d2, base + "_SMU2")
-            status.config(text=f"Done. Incremental files in: {run_folder}")
+            status.config(text=f"Done. Incremental files in: {run_folder_primary}")
         except Exception as ex:
             status.config(text=f"Error: {ex}")
         finally:
