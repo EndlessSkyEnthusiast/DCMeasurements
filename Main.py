@@ -7025,6 +7025,14 @@ def TempSweepIV():
     tk.Checkbutton(win, text='Setpoint-Jitter (±50%)', variable=exactvariation).pack(anchor='w', padx=12)
 
     swap_axes = tk.IntVar(value=0)
+    swap_axes_state = {'value': False}
+    def _sync_swap_axes(*_):
+        try:
+            swap_axes_state['value'] = bool(swap_axes.get())
+        except Exception:
+            pass
+    swap_axes.trace_add('write', _sync_swap_axes)
+    _sync_swap_axes()
     tk.Checkbutton(win, text='Swap axes (Voltage on X)', variable=swap_axes).pack(anchor='w', padx=12)
     progress_var = tk.DoubleVar(value=0.0)
     progress = ttk.Progressbar(win, variable=progress_var, maximum=100.0)
@@ -7033,6 +7041,13 @@ def TempSweepIV():
     eta_label.pack(fill=tk.X, padx=10)
     status = tk.Label(win, text="Ready")
     status.pack(fill=tk.X, padx=10, pady=6)
+
+    def _ui_call(fn):
+        try:
+            if win.winfo_exists():
+                win.after(0, fn)
+        except Exception:
+            pass
 
     def _set_sense(dev, is4):
         try: dev.smua.sense = dev.smua.SENSE_REMOTE if is4 else dev.smua.SENSE_LOCAL
@@ -7198,7 +7213,7 @@ def TempSweepIV():
                         temperature_control.stop()
                     except Exception:
                         pass
-                    status.config(text=f"Fast cooldown active: T={current_t:.3f} K > 5.000 K (TC stopped)")
+                    _ui_call(lambda txt=f"Fast cooldown active: T={current_t:.3f} K > 5.000 K (TC stopped)": status.config(text=txt))
                 elif target_t > 3.0:
                     temperature_control.start((target_t, ramp))
                 else:
@@ -7221,17 +7236,16 @@ def TempSweepIV():
                         eta_txt = "00:00:00"
                     else:
                         eta_txt = "--:--:--"
-                    progress_var.set(max(0.0, min(100.0, progress_pct)))
-                    eta_label.config(text=f"Progress: {progress_pct:5.1f}% | ETA: {eta_txt}")
+                    _ui_call(lambda p=max(0.0, min(100.0, progress_pct)), e=eta_txt: (progress_var.set(p), eta_label.config(text=f"Progress: {p:5.1f}% | ETA: {e}")))
                     if fast_cool_mode and T_now <= 5.0:
                         fast_cool_mode = False
                         if target_t > 3.0:
                             temperature_control.start((target_t, ramp))
-                            status.config(text=f"T={T_now:.3f} K < 5K: TC resumed to {target_t:.3f} K")
+                            _ui_call(lambda txt=f"T={T_now:.3f} K < 5K: TC resumed to {target_t:.3f} K": status.config(text=txt))
                         else:
                             adr_control.start_adr(setpoint=target_t, ramp=ramp, adr_mode=None, operation_mode='cadr', auto_regenerate=True, pre_regenerate=bool(regen))
-                            status.config(text=f"T={T_now:.3f} K < 5K: ADR resumed to {target_t:.3f} K")
-                    status.config(text=f"T={T_now:.3f} K -> {target_t:.3f} K")
+                            _ui_call(lambda txt=f"T={T_now:.3f} K < 5K: ADR resumed to {target_t:.3f} K": status.config(text=txt))
+                    _ui_call(lambda txt=f"T={T_now:.3f} K -> {target_t:.3f} K": status.config(text=txt))
                     if use_smu1.get() and use_smu2.get():
                         if alt['next'] == 1:
                             times, xs, ys = _measure_curve(k, mode, levels, rt1, T_now)
@@ -7239,7 +7253,7 @@ def TempSweepIV():
                             _save_curve_incremental(run_folder_primary, "SMU1", curve_idx['SMU1'], times, xs, ys, T_now, base_smu1, section_start_t, target_t)
                             _save_curve_incremental(run_folder_backup, "SMU1", curve_idx['SMU1'], times, xs, ys, T_now, base_smu1, section_start_t, target_t)
                             if cur_ax is not None:
-                                if swap_axes.get():
+                                if swap_axes_state['value']:
                                     px, py = ys, xs
                                     xl, yl = 'Voltage(V)', 'Current(A)'
                                 else:
@@ -7259,7 +7273,7 @@ def TempSweepIV():
                             _save_curve_incremental(run_folder_primary, "SMU2", curve_idx['SMU2'], times, xs, ys, T_now, base_smu2, section_start_t, target_t)
                             _save_curve_incremental(run_folder_backup, "SMU2", curve_idx['SMU2'], times, xs, ys, T_now, base_smu2, section_start_t, target_t)
                             if cur_ax is not None:
-                                if swap_axes.get():
+                                if swap_axes_state['value']:
                                     px, py = ys, xs
                                     xl, yl = 'Voltage(V)', 'Current(A)'
                                 else:
@@ -7309,11 +7323,11 @@ def TempSweepIV():
                     try: temperature_control.stop()
                     except Exception: pass
 
-            progress_var.set(100.0)
-            eta_label.config(text="Progress: 100.0% | ETA: 00:00:00")
-            status.config(text=f"Done. Incremental files in: {run_folder_primary}/{base_smu1} and/or {run_folder_primary}/{base_smu2}")
+            _ui_call(lambda: progress_var.set(100.0))
+            _ui_call(lambda: eta_label.config(text="Progress: 100.0% | ETA: 00:00:00"))
+            _ui_call(lambda txt=f"Done. Incremental files in: {run_folder_primary}/{base_smu1} and/or {run_folder_primary}/{base_smu2}": status.config(text=txt))
         except Exception as ex:
-            status.config(text=f"Error: {ex}")
+            _ui_call(lambda txt=f"Error: {ex}": status.config(text=txt))
         finally:
             try: k.smua.source.output = 0
             except Exception: pass
