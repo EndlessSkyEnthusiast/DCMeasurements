@@ -6902,9 +6902,11 @@ def TempSweepIV():
     use_smu1 = tk.IntVar(value=1); use_smu2 = tk.IntVar(value=1)
     smu1_4wire = tk.IntVar(value=1); smu2_4wire = tk.IntVar(value=1)
     tk.Checkbutton(top_opts, text="Use SMU1", variable=use_smu1).grid(row=0, column=0, sticky='w', padx=4)
-    tk.Checkbutton(top_opts, text="Use SMU2", variable=use_smu2).grid(row=0, column=1, sticky='w', padx=4)
-    tk.Checkbutton(top_opts, text="SMU1 4 Point (remote) / 2 Point (local)", variable=smu1_4wire).grid(row=0, column=2, sticky='w', padx=4)
-    tk.Checkbutton(top_opts, text="SMU2 4 Point (remote) / 2 Point (local)", variable=smu2_4wire).grid(row=0, column=3, sticky='w', padx=4)
+    tk.Label(top_opts, text="--- 2Point").grid(row=0, column=1, sticky='e', padx=(4, 2))
+    tk.Checkbutton(top_opts, text="4Point", variable=smu1_4wire).grid(row=0, column=2, sticky='w', padx=(2, 10))
+    tk.Checkbutton(top_opts, text="Use SMU2", variable=use_smu2).grid(row=1, column=0, sticky='w', padx=4)
+    tk.Label(top_opts, text="--- 2Point").grid(row=1, column=1, sticky='e', padx=(4, 2))
+    tk.Checkbutton(top_opts, text="4Point", variable=smu2_4wire).grid(row=1, column=2, sticky='w', padx=(2, 10))
 
     iv_frame = ttk.LabelFrame(win, text="IV Sweep Settings (like IV Sweeps)")
     iv_frame.pack(padx=10, pady=8, fill='x')
@@ -6934,20 +6936,27 @@ def TempSweepIV():
     comp_i_entry = tk.Entry(iv_frame, width=14)
     comp_i_entry.grid(row=3, column=3, sticky='w')
 
-    temp_sections = ttk.LabelFrame(win, text="Temperature Sections (like Parallel 4-point Tc)")
+    temp_sections = ttk.LabelFrame(win, text="Temperature Targets")
     temp_sections.pack(padx=10, pady=8, fill='x')
     section_frames = []
-    def add_temp_section():
-        fr = create_tc_frame(temp_sections)
-        fr.pack(fill=tk.X)
+    def add_temp_section(default_target="4.0", default_ramp="1.0"):
+        fr = ttk.Frame(temp_sections)
+        fr.pack(fill=tk.X, pady=2)
+        tk.Label(fr, text="Target T [K]").grid(row=0, column=0, padx=5, sticky='w')
+        e_target = tk.Entry(fr, width=10); e_target.insert(0, default_target); e_target.grid(row=0, column=1, padx=4)
+        tk.Label(fr, text="Ramp [K/min]").grid(row=0, column=2, padx=5, sticky='w')
+        e_ramp = tk.Entry(fr, width=10); e_ramp.insert(0, default_ramp); e_ramp.grid(row=0, column=3, padx=4)
         regen = tk.IntVar(value=0)
-        tk.Checkbutton(fr, text="Regenerate", variable=regen).grid(row=0, column=8)
+        tk.Checkbutton(fr, text="Regenerate", variable=regen).grid(row=0, column=4, padx=4)
+        fr.target_entry = e_target
+        fr.ramp_entry = e_ramp
         fr.regenerate_var = regen
         section_frames.append(fr)
     add_temp_section()
 
+    tk.Label(iv_frame, text="Sweep path: 0 → Max → 0 → -Max → 0").grid(row=4, column=0, columnspan=4, sticky='w', padx=4)
     stop5k = tk.IntVar(value=1)
-    tk.Checkbutton(win, text="Cooldown stop at 5K via Temperature Control", variable=stop5k).pack(anchor='w', padx=12)
+    tk.Checkbutton(win, text='Fast cooldown above 5K', variable=stop5k).pack(anchor='w', padx=12)
     status = tk.Label(win, text="Ready")
     status.pack(fill=tk.X, padx=10, pady=6)
 
@@ -6997,6 +7006,12 @@ def TempSweepIV():
             xs.append(i_val); ys.append(v_val)
         return xs, ys
 
+    def _save_curve_incremental(base_dir, smu_name, idx, xs, ys, temp_now):
+        os.makedirs(base_dir, exist_ok=True)
+        single_path = os.path.join(base_dir, f"{smu_name}_curve_{idx:05d}.txt")
+        table = np.column_stack([np.array(xs, dtype=float), np.array(ys, dtype=float), np.full(len(xs), float(temp_now))])
+        np.savetxt(single_path, table, fmt="%.9e", delimiter='\t', header="Current[A]\tVoltage[V]\tTemperature[K]", comments='')
+
     def _run():
         try:
             if not use_smu1.get() and not use_smu2.get():
@@ -7009,8 +7024,7 @@ def TempSweepIV():
             comp_i_txt = comp_i_entry.get()
             sections = []
             for fr in section_frames:
-                w = fr.winfo_children()
-                sections.append((float(w[1].get()), float(w[3].get()), float(w[5].get()), int(fr.regenerate_var.get())))
+                sections.append((float(fr.target_entry.get()), float(fr.ramp_entry.get()), int(fr.regenerate_var.get())))
 
             if use_smu1.get():
                 _set_sense(k, bool(smu1_4wire.get()))
@@ -7021,6 +7035,10 @@ def TempSweepIV():
             rt1 = ResultTable(column_titles=['Time','Current [A]','Voltage[V]','Temperature[K]'], units=[' ','A','V','K'], params={'recorded': time.asctime(), 'sweep_type': 'tempsweepiv'}) if use_smu1.get() else None
             rt2l = ResultTable(column_titles=['Time','Current [A]','Voltage[V]','Temperature[K]'], units=[' ','A','V','K'], params={'recorded': time.asctime(), 'sweep_type': 'tempsweepiv'}) if use_smu2.get() else None
             alt = {'next': 1}
+            curve_idx = {'SMU1': 0, 'SMU2': 0}
+            base = simpledialog.askstring("Filename", "Base filename for TempSweepIV:") or "TempSweepIV"
+            run_folder = os.path.join(SAVE_PATH_2, get_filename(base))
+            os.makedirs(run_folder, exist_ok=True)
 
             # Plot windows: if both SMUs selected => current curve + all SMU1 + all SMU2
             cmap = plt.cm.plasma
@@ -7035,27 +7053,36 @@ def TempSweepIV():
                 smu2_ax.set_title("All IV Curves - SMU2 (colored by T)")
                 cur_ax.set_title("Current IV Curve")
 
-            for start_t, end_t, ramp, regen in sections:
-                if start_t > 3.0:
-                    temperature_control.start((start_t, ramp))
+            for target_t, ramp, regen in sections:
+                current_t = float(client.query('T_sample.kelvin') or 300.0)
+                fast_cool_mode = bool(stop5k.get() and (target_t < current_t) and (current_t > 5.0))
+                if fast_cool_mode:
+                    try:
+                        temperature_control.stop()
+                    except Exception:
+                        pass
+                    status.config(text=f"Fast cooldown active: T={current_t:.3f} K > 5.000 K (TC stopped)")
+                elif target_t > 3.0:
+                    temperature_control.start((target_t, ramp))
                 else:
-                    adr_control.start_adr(setpoint=start_t, ramp=ramp, adr_mode=None, operation_mode='cadr', auto_regenerate=True, pre_regenerate=bool(regen))
-                while abs(float(client.query('T_sample.kelvin') or 300.0) - start_t) > 0.1:
-                    time.sleep(0.2)
+                    adr_control.start_adr(setpoint=target_t, ramp=ramp, adr_mode=None, operation_mode='cadr', auto_regenerate=True, pre_regenerate=bool(regen))
 
-                if end_t > 3.0:
-                    temperature_control.start((end_t, ramp))
-                else:
-                    try: temperature_control.stop()
-                    except Exception: pass
-                    adr_control.start_adr(setpoint=end_t, ramp=ramp, adr_mode=None, operation_mode='cadr', auto_regenerate=True, pre_regenerate=bool(regen))
-
-                while abs(float(client.query('T_sample.kelvin') or 300.0) - end_t) > (0.05 if end_t > 3 else 0.02):
+                while abs(float(client.query('T_sample.kelvin') or 300.0) - target_t) > (0.05 if target_t > 3 else 0.02):
                     T_now = float(client.query('T_sample.kelvin') or 300.0)
-                    status.config(text=f"T={T_now:.3f} K -> {end_t:.3f} K")
+                    if fast_cool_mode and T_now <= 5.0:
+                        fast_cool_mode = False
+                        if target_t > 3.0:
+                            temperature_control.start((target_t, ramp))
+                            status.config(text=f"T={T_now:.3f} K < 5K: TC resumed to {target_t:.3f} K")
+                        else:
+                            adr_control.start_adr(setpoint=target_t, ramp=ramp, adr_mode=None, operation_mode='cadr', auto_regenerate=True, pre_regenerate=bool(regen))
+                            status.config(text=f"T={T_now:.3f} K < 5K: ADR resumed to {target_t:.3f} K")
+                    status.config(text=f"T={T_now:.3f} K -> {target_t:.3f} K")
                     if use_smu1.get() and use_smu2.get():
                         if alt['next'] == 1:
                             xs, ys = xs, ys = _measure_curve(k, mode, levels, rt1, T_now)
+                            curve_idx['SMU1'] += 1
+                            _save_curve_incremental(run_folder, "SMU1", curve_idx['SMU1'], xs, ys, T_now)
                             if cur_ax is not None:
                                 cur_ax.clear(); cur_ax.plot(xs, ys, '-o', color='black', markersize=2); cur_ax.set_xlabel('Current(A)'); cur_ax.set_ylabel('Voltage(V)'); cur_ax.set_title(f'Current IV Curve @ {T_now:.3f}K SMU1'); cur_fig.canvas.draw_idle()
                                 c = cmap(min(1.0, max(0.0, T_now/300.0))); smu1_ax.plot(xs, ys, '-', color=c, alpha=0.9); smu1_fig.canvas.draw_idle()
@@ -7063,6 +7090,8 @@ def TempSweepIV():
                             if wait_between_curves_s > 0: time.sleep(wait_between_curves_s)
                         else:
                             xs, ys = xs, ys = _measure_curve(k2, mode, levels, rt2l, T_now)
+                            curve_idx['SMU2'] += 1
+                            _save_curve_incremental(run_folder, "SMU2", curve_idx['SMU2'], xs, ys, T_now)
                             if cur_ax is not None:
                                 cur_ax.clear(); cur_ax.plot(xs, ys, '-o', color='black', markersize=2); cur_ax.set_xlabel('Current(A)'); cur_ax.set_ylabel('Voltage(V)'); cur_ax.set_title(f'Current IV Curve @ {T_now:.3f}K SMU2'); cur_fig.canvas.draw_idle()
                                 c = cmap(min(1.0, max(0.0, T_now/300.0))); smu2_ax.plot(xs, ys, '-', color=c, alpha=0.9); smu2_fig.canvas.draw_idle()
@@ -7070,24 +7099,29 @@ def TempSweepIV():
                             if wait_between_curves_s > 0: time.sleep(wait_between_curves_s)
                     elif use_smu1.get():
                         xs, ys = _measure_curve(k, mode, levels, rt1, T_now)
+                        curve_idx['SMU1'] += 1
+                        _save_curve_incremental(run_folder, "SMU1", curve_idx['SMU1'], xs, ys, T_now)
                         if wait_between_curves_s > 0: time.sleep(wait_between_curves_s)
                     elif use_smu2.get():
                         xs, ys = _measure_curve(k2, mode, levels, rt2l, T_now)
+                        curve_idx['SMU2'] += 1
+                        _save_curve_incremental(run_folder, "SMU2", curve_idx['SMU2'], xs, ys, T_now)
                         if wait_between_curves_s > 0: time.sleep(wait_between_curves_s)
 
             if stop5k.get():
-                temperature_control.start((5.0, 5.0))
-                while abs(float(client.query('T_sample.kelvin') or 300.0) - 5.0) > 0.1:
-                    time.sleep(0.2)
-                try: temperature_control.stop()
-                except Exception: pass
+                cur_t = float(client.query('T_sample.kelvin') or 300.0)
+                if 5.0 < cur_t:
+                    temperature_control.start((5.0, 5.0))
+                    while float(client.query('T_sample.kelvin') or 300.0) > 5.0:
+                        time.sleep(0.2)
+                    try: temperature_control.stop()
+                    except Exception: pass
 
-            base = simpledialog.askstring("Filename", "Base filename for TempSweepIV:") or "TempSweepIV"
             if rt1 is not None:
                 d1 = np.array([[ts] + list(map(float, vals)) for ts, *vals in rt1.data], dtype=object); safe_file(d1, base + "_SMU1")
             if rt2l is not None:
                 d2 = np.array([[ts] + list(map(float, vals)) for ts, *vals in rt2l.data], dtype=object); safe_file(d2, base + "_SMU2")
-            status.config(text="Done")
+            status.config(text=f"Done. Incremental files in: {run_folder}")
         except Exception as ex:
             status.config(text=f"Error: {ex}")
         finally:
@@ -7274,4 +7308,3 @@ def test_smu_basic(max_current=1e-6, extra_reads=5):
 
     print("\nTest fertig. Beide Kanäle wurden bis max "
           f"{max_current:.2e} A geprüft.")
-
