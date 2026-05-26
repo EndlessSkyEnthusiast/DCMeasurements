@@ -3671,7 +3671,7 @@ def create_sweep():
     save_checkbutton = tk.Checkbutton(controls_frame, text="Save Measurement Settings", variable=save_var)
     save_checkbutton.pack(side=tk.LEFT)  # Adjust the side argument as needed
     # Add the checkbox for Local/Remote measurement here
-    local_remote_checkbox = tk.Checkbutton(controls_frame, text="4 Point", variable=local_remote_var)
+    local_remote_checkbox = tk.Checkbutton(controls_frame, text="4 Point (remote) / 2 Point (local)", variable=local_remote_var)
     local_remote_checkbox.pack(side=tk.LEFT)
     smu2_checkbox = tk.Checkbutton(controls_frame, text="Use SMU2", variable=use_smu2_var)
     smu2_checkbox.pack(side=tk.LEFT)
@@ -3814,7 +3814,7 @@ def IV_Temp():
 
     controls_frame = tk.Frame(iv_temp_window)
     controls_frame.pack(fill=tk.X)  # Use pack to place controls_frame correctly
-    local_remote_checkbox = tk.Checkbutton(controls_frame, text="4 Point", variable=local_remote_var)
+    local_remote_checkbox = tk.Checkbutton(controls_frame, text="4 Point (remote) / 2 Point (local)", variable=local_remote_var)
     local_remote_checkbox.pack(side=tk.LEFT)
     smu2_checkbox = tk.Checkbutton(controls_frame, text="Use SMU2", variable=use_smu2_var)
     smu2_checkbox.pack(side=tk.LEFT)
@@ -4038,7 +4038,7 @@ def create_current_temp_sweep_range():
         stop_event.set()
         stop_button.config(state=tk.DISABLED)
 
-    local_remote_checkbox = tk.Checkbutton(controls_frame, text="4 Point", variable=local_remote_var)
+    local_remote_checkbox = tk.Checkbutton(controls_frame, text="4 Point (remote) / 2 Point (local)", variable=local_remote_var)
     local_remote_checkbox.pack(side=tk.LEFT)
     smu2_checkbox = tk.Checkbutton(controls_frame, text="Use SMU2", variable=use_smu2_var)
     smu2_checkbox.pack(side=tk.LEFT)
@@ -4642,6 +4642,48 @@ def create_parallel_tc_measurement():
 
 #%% Cell 10: Parallel Tc Measurement 4-Point Sense (ADV patched with BASIC features)
 #%% Cell 10: Parallel Tc Measurement 4-Point Sense (LOW-NOISE + SMU selection)
+
+
+def _measure_selected_smus_alternating(smu1_enabled, smu2_enabled, alternation_state, extra_reads, temp_now, timestamp, rt_obj=None, rt2_obj=None, res1=None, res2=None):
+    """
+    Measure active SMUs. If both are active, alternate between SMU1 and SMU2 on each call.
+    Returns list of measured labels in this call.
+    """
+    measured = []
+    if smu1_enabled and smu2_enabled:
+        pick_smu1 = (alternation_state.get("next", 1) == 1)
+        if pick_smu1:
+            i1, v1 = _meas_iv(k, extra_reads=extra_reads)
+            if rt_obj is not None:
+                rt_obj.append_row([timestamp, i1, v1, temp_now])
+            if res1 is not None:
+                res1.append(v1/i1 if (i1 and abs(i1) > 0) else float('nan'))
+            measured.append("SMU1")
+            alternation_state["next"] = 2
+        else:
+            i2, v2 = _meas_iv(k2, extra_reads=extra_reads)
+            if rt2_obj is not None:
+                rt2_obj.append_row([timestamp, i2, v2, temp_now])
+            if res2 is not None:
+                res2.append(v2/i2 if (i2 and abs(i2) > 0) else float('nan'))
+            measured.append("SMU2")
+            alternation_state["next"] = 1
+    elif smu1_enabled:
+        i1, v1 = _meas_iv(k, extra_reads=extra_reads)
+        if rt_obj is not None:
+            rt_obj.append_row([timestamp, i1, v1, temp_now])
+        if res1 is not None:
+            res1.append(v1/i1 if (i1 and abs(i1) > 0) else float('nan'))
+        measured.append("SMU1")
+    elif smu2_enabled:
+        i2, v2 = _meas_iv(k2, extra_reads=extra_reads)
+        if rt2_obj is not None:
+            rt2_obj.append_row([timestamp, i2, v2, temp_now])
+        if res2 is not None:
+            res2.append(v2/i2 if (i2 and abs(i2) > 0) else float('nan'))
+        measured.append("SMU2")
+    return measured
+
 def create_parallel_4pt_measurement_Sense():
     """
     Parallel Tc measurement with:
@@ -4965,6 +5007,7 @@ def create_parallel_4pt_measurement_Sense():
                 ani2 = FuncAnimation(fig2, update_plot2, frames=10000, repeat=False, interval=3000); ani2._start()
 
             total_target = maximumProgress
+            alternation_state = {"next": 1}
             # ---------------- Manueller Modus ----------------
             if manual_mode:
                 if tc_data:
@@ -4973,15 +5016,11 @@ def create_parallel_4pt_measurement_Sense():
                     temp = float(temperature_control.kelvin) if hasattr(temperature_control, 'kelvin') else float(client.query('T_sample.kelvin') or 300.0)
                     ts = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
-                    if smu1_on_var.get():
-                        i1, v1 = _meas_iv(k, extra_reads=extra_reads)
-                        rt.append_row([ts, i1, v1, temp])
-                        Resistance_data1.append(v1/i1 if (i1 and abs(i1) > 0) else float('nan'))
-                    if smu2_on_var.get():
-                        i2, v2 = _meas_iv(k2, extra_reads=extra_reads)
-                        rt2.append_row([ts, i2, v2, temp])
-                        Resistance_data2.append(v2/i2 if (i2 and abs(i2) > 0) else float('nan'))
-
+                    _measure_selected_smus_alternating(
+                        bool(smu1_on_var.get()), bool(smu2_on_var.get()), alternation_state,
+                        extra_reads, temp, ts, rt_obj=rt, rt2_obj=rt2,
+                        res1=Resistance_data1, res2=Resistance_data2
+                    )
                     Temp_data.append(temp)
 
                     elapsed = time.time() - start_time
@@ -5039,14 +5078,11 @@ def create_parallel_4pt_measurement_Sense():
                         ts = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
                         if measurement_started.get() == 1:
-                            if smu1_on_var.get():
-                                i1, v1 = _meas_iv(k, extra_reads=extra_reads)
-                                rt.append_row([ts, i1, v1, T_now])
-                                Resistance_data1.append(v1/i1 if (i1 and abs(i1) > 0) else float('nan'))
-                            if smu2_on_var.get():
-                                i2, v2 = _meas_iv(k2, extra_reads=extra_reads)
-                                rt2.append_row([ts, i2, v2, T_now])
-                                Resistance_data2.append(v2/i2 if (i2 and abs(i2) > 0) else float('nan'))
+                            _measure_selected_smus_alternating(
+                                bool(smu1_on_var.get()), bool(smu2_on_var.get()), alternation_state,
+                                extra_reads, T_now, ts, rt_obj=rt, rt2_obj=rt2,
+                                res1=Resistance_data1, res2=Resistance_data2
+                            )
                             Temp_data.append(T_now)
 
                         # Fortschritt: Annäherung
@@ -5102,14 +5138,11 @@ def create_parallel_4pt_measurement_Sense():
                             T_now = float(temperature_control.kelvin) if hasattr(temperature_control, 'kelvin') else float(client.query('T_sample.kelvin') or 300.0)
                             ts = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
-                            if smu1_on_var.get():
-                                i1, v1 = _meas_iv(k, extra_reads=extra_reads)
-                                rt.append_row([ts, i1, v1, T_now])
-                                Resistance_data1.append(v1/i1 if (i1 and abs(i1) > 0) else float('nan'))
-                            if smu2_on_var.get():
-                                i2, v2 = _meas_iv(k2, extra_reads=extra_reads)
-                                rt2.append_row([ts, i2, v2, T_now])
-                                Resistance_data2.append(v2/i2 if (i2 and abs(i2) > 0) else float('nan'))
+                            _measure_selected_smus_alternating(
+                                bool(smu1_on_var.get()), bool(smu2_on_var.get()), alternation_state,
+                                extra_reads, T_now, ts, rt_obj=rt, rt2_obj=rt2,
+                                res1=Resistance_data1, res2=Resistance_data2
+                            )
                             Temp_data.append(T_now)
 
                             # Fortschritt: Rampe
@@ -5716,7 +5749,7 @@ def create_sweep_current():
     save_checkbutton = tk.Checkbutton(controls_frame, text="Save Measurement Settings", variable=save_var)
     save_checkbutton.pack(side=tk.LEFT)  # Adjust the side argument as needed
     # Add the checkbox for Local/Remote measurement here
-    local_remote_checkbox = tk.Checkbutton(controls_frame, text="4 Point", variable=local_remote_var)
+    local_remote_checkbox = tk.Checkbutton(controls_frame, text="4 Point (remote) / 2 Point (local)", variable=local_remote_var)
     local_remote_checkbox.pack(side=tk.LEFT)
     smu2_checkbox = tk.Checkbutton(controls_frame, text="Use SMU2", variable=use_smu2_var)
     smu2_checkbox.pack(side=tk.LEFT)
@@ -6895,6 +6928,7 @@ add_button_with_details_and_load(
 add_button_with_details_and_load(iv_frame, "Single IV Curve Current", create_sweep_current, "Start: Start Current in muA, End: End Current in muA, Steps: Amount of Steps (Integer). Checkbox Unchecked: Connect SMU1 HI and SMU1 LO to your device. Checkbox Checked: Connect SMU1 HI and SMU1 LO to your device as outer electrodes and SMU1 Sense Hi and SMU1 Sense Lo as inner electrodes. Range: -0.1A;0.1A",load_sweep_current)
 add_button_with_details_and_load(iv_frame, "Single IV Curve Voltage", create_sweep, "Start: Start Voltage, End: End Voltage, Steps: Amount of Steps (Integer). Connect SMU1 HI and SMU1 LO to your device. Range: -20V;20V",load_sweep)
 add_button_with_details(tc_frame, "Voltage sweep at several temperatures", IV_Temp, "Connect SMU1 HI and SMU1 LO to your device. Range: -20;20V, 0.2K;290K")
+add_button_with_details(tc_frame, "TempSweepIV (alternating)", TempSweepIV, "Temperature sweep with alternating SMU1/SMU2 sampling. Above 3K uses TemperatureControl, below 3K uses ADRControl. Optional 5K cooldown stop.")
 add_button_with_details(tc_frame, "Current sweep at several temperatures", create_current_temp_sweep_range, "Current sweep in µA at multiple temperatures. Define Start/End temperature and intermediate steps; each temperature runs one full Add-Section current cycle, then saves a file with filename + temperature.")
 add_button_with_details(tc_frame, "2 Point Tc Measurement", create_tc_measurement, "Connect SMU1 HI and SMU1 LO to your device. Range: 1muA;100mA, 0.2K;290K, high power might reduce Temperature Range. Recommended: 100muA")
 add_button_with_details(tc_frame, "4-point Tc Measurement 2 SMU Classic", create_4ptc_measurement, "Connect SMU1 HI and SMU1 LO to your device as outer electrodes and SMU2 HI and SMU2 Lo as inner electrodes. Range 1muA;100mA, 0.2K;290K, high power might reduce Temperature Range. Recommended: 100muA")
@@ -7020,3 +7054,92 @@ def test_smu_basic(max_current=1e-6, extra_reads=5):
 
     print("\nTest fertig. Beide Kanäle wurden bis max "
           f"{max_current:.2e} A geprüft.")
+
+#%% Cell 6c: TempSweepIV (alternating SMU1/SMU2 during temperature sweep)
+def TempSweepIV():
+    global measurement
+    measurement = 1
+
+    win = tk.Toplevel(root)
+    win.title("TempSweepIV")
+    win.protocol("WM_DELETE_WINDOW", lambda: on_closing(win))
+
+    frm = tk.Frame(win); frm.pack(padx=10, pady=10, fill=tk.X)
+    tk.Label(frm, text="Targets [K] comma-separated").grid(row=0, column=0, sticky='w')
+    temps_entry = tk.Entry(frm, width=50)
+    temps_entry.insert(0, "270,0.5")
+    temps_entry.grid(row=0, column=1, columnspan=3, padx=6)
+
+    use_smu1 = tk.IntVar(value=1); use_smu2 = tk.IntVar(value=1)
+    tk.Checkbutton(frm, text="Use SMU1", variable=use_smu1).grid(row=1, column=0, sticky='w')
+    tk.Checkbutton(frm, text="Use SMU2", variable=use_smu2).grid(row=1, column=1, sticky='w')
+    stop5k = tk.IntVar(value=1)
+    tk.Checkbutton(frm, text="Cooldown stop at 5K via Temperature Control", variable=stop5k).grid(row=1, column=2, columnspan=2, sticky='w')
+
+    tk.Label(frm, text="Ramp [K/min]").grid(row=2, column=0, sticky='w')
+    ramp_entry = tk.Entry(frm, width=10); ramp_entry.insert(0, "2")
+    ramp_entry.grid(row=2, column=1, sticky='w')
+
+    tk.Label(frm, text="Measure interval [s]").grid(row=2, column=2, sticky='e')
+    dt_entry = tk.Entry(frm, width=10); dt_entry.insert(0, "0.3")
+    dt_entry.grid(row=2, column=3, sticky='w')
+
+    status = tk.Label(win, text="Ready")
+    status.pack(fill=tk.X, padx=10, pady=(0, 10))
+
+    def _drive_temperature(target, ramp):
+        now = float(client.query('T_sample.kelvin') or 300.0)
+        if target > 3.0 or now > 3.0:
+            try: adr_control.stop_adr()
+            except Exception: pass
+            temperature_control.start((target, ramp))
+        else:
+            try: temperature_control.stop()
+            except Exception: pass
+            adr_control.start_adr(setpoint=target, ramp=ramp, adr_mode=None, operation_mode='cadr', auto_regenerate=True, pre_regenerate=False)
+
+    def _run():
+        try:
+            targets = _parse_temperature_list(temps_entry.get())
+            ramp = float(ramp_entry.get())
+            dt = float(dt_entry.get())
+            if not targets:
+                raise ValueError("No temperature targets provided")
+
+            rt1 = ResultTable(column_titles=['Time','Current [A]','Voltage[V]','Temperature[K]'], units=[' ','A','V','K'], params={'recorded': time.asctime(), 'sweep_type': 'tempsweepiv'}) if use_smu1.get() else None
+            rt2l = ResultTable(column_titles=['Time','Current [A]','Voltage[V]','Temperature[K]'], units=[' ','A','V','K'], params={'recorded': time.asctime(), 'sweep_type': 'tempsweepiv'}) if use_smu2.get() else None
+            alt = {'next': 1}
+
+            for tgt in targets:
+                status.config(text=f"Driving to {tgt} K")
+                _drive_temperature(tgt, ramp)
+                while abs(float(client.query('T_sample.kelvin') or 300.0) - tgt) > (0.05 if tgt > 3 else 0.02):
+                    T_now = float(client.query('T_sample.kelvin') or 300.0)
+                    ts = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                    _measure_selected_smus_alternating(bool(use_smu1.get()), bool(use_smu2.get()), alt, 1, T_now, ts, rt_obj=rt1, rt2_obj=rt2l)
+                    time.sleep(max(0.05, dt))
+
+            if stop5k.get():
+                status.config(text="Temperature Control Stop -> 5K")
+                temperature_control.start((5.0, ramp))
+                while abs(float(client.query('T_sample.kelvin') or 300.0) - 5.0) > 0.1:
+                    time.sleep(0.2)
+                try: temperature_control.stop()
+                except Exception: pass
+
+            base = simpledialog.askstring("Filename", "Base filename for TempSweepIV:") or "TempSweepIV"
+            if rt1 is not None:
+                d1 = np.array([[ts] + list(map(float, vals)) for ts, *vals in rt1.data], dtype=object)
+                safe_file(d1, base + "_SMU1")
+            if rt2l is not None:
+                d2 = np.array([[ts] + list(map(float, vals)) for ts, *vals in rt2l.data], dtype=object)
+                safe_file(d2, base + "_SMU2")
+            status.config(text="Done")
+        except Exception as ex:
+            status.config(text=f"Error: {ex}")
+        finally:
+            global measurement
+            measurement = 0
+
+    tk.Button(win, text="Start TempSweepIV", command=lambda: threading.Thread(target=_run, daemon=True).start()).pack(pady=(0,10))
+    return win
