@@ -6949,12 +6949,17 @@ def TempSweepIV():
             pass
 
     def _measure_curve(dev, mode, levels_si, rt_obj, temp_now):
+        xs, ys = [], []
         for L in levels_si:
             _apply_level(dev, mode, L)
             time.sleep(0.02)
             meas = float(dev.smua.measure.v()) if mode == 'I' else float(dev.smua.measure.i())
+            i_val = L if mode == 'I' else meas
+            v_val = meas if mode == 'I' else L
             ts = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-            rt_obj.append_row([ts, L if mode == 'I' else meas, meas if mode == 'I' else L, temp_now])
+            rt_obj.append_row([ts, i_val, v_val, temp_now])
+            xs.append(i_val); ys.append(v_val)
+        return xs, ys
 
     def _run():
         try:
@@ -6972,6 +6977,19 @@ def TempSweepIV():
             rt1 = ResultTable(column_titles=['Time','Current [A]','Voltage[V]','Temperature[K]'], units=[' ','A','V','K'], params={'recorded': time.asctime(), 'sweep_type': 'tempsweepiv'}) if use_smu1.get() else None
             rt2l = ResultTable(column_titles=['Time','Current [A]','Voltage[V]','Temperature[K]'], units=[' ','A','V','K'], params={'recorded': time.asctime(), 'sweep_type': 'tempsweepiv'}) if use_smu2.get() else None
             alt = {'next': 1}
+
+            # Plot windows: if both SMUs selected => current curve + all SMU1 + all SMU2
+            cmap = plt.cm.plasma
+            cur_w, cur_fig, cur_ax = None, None, None
+            smu1_w, smu1_fig, smu1_ax = None, None, None
+            smu2_w, smu2_fig, smu2_ax = None, None, None
+            if use_smu1.get() and use_smu2.get():
+                cur_w, cur_fig, cur_ax, _ = create_plot_window_for_Voltage_Current("TempSweepIV - Current Curve")
+                smu1_w, smu1_fig, smu1_ax, _ = create_plot_window_for_Voltage_Current("TempSweepIV - All Curves SMU1")
+                smu2_w, smu2_fig, smu2_ax, _ = create_plot_window_for_Voltage_Current("TempSweepIV - All Curves SMU2")
+                smu1_ax.set_title("All IV Curves - SMU1 (colored by T)")
+                smu2_ax.set_title("All IV Curves - SMU2 (colored by T)")
+                cur_ax.set_title("Current IV Curve")
 
             for start_t, end_t, ramp, regen in sections:
                 if start_t > 3.0:
@@ -6993,13 +7011,21 @@ def TempSweepIV():
                     status.config(text=f"T={T_now:.3f} K -> {end_t:.3f} K")
                     if use_smu1.get() and use_smu2.get():
                         if alt['next'] == 1:
-                            _measure_curve(k, mode, levels, rt1, T_now); alt['next'] = 2
+                            xs, ys = xs, ys = _measure_curve(k, mode, levels, rt1, T_now)
+                            if cur_ax is not None:
+                                cur_ax.clear(); cur_ax.plot(xs, ys, '-o', color='black', markersize=2); cur_ax.set_xlabel('Current(A)'); cur_ax.set_ylabel('Voltage(V)'); cur_ax.set_title(f'Current IV Curve @ {T_now:.3f}K SMU1'); cur_fig.canvas.draw_idle()
+                                c = cmap(min(1.0, max(0.0, T_now/300.0))); smu1_ax.plot(xs, ys, '-', color=c, alpha=0.9); smu1_fig.canvas.draw_idle()
+                            alt['next'] = 2
                         else:
-                            _measure_curve(k2, mode, levels, rt2l, T_now); alt['next'] = 1
+                            xs, ys = xs, ys = _measure_curve(k2, mode, levels, rt2l, T_now)
+                            if cur_ax is not None:
+                                cur_ax.clear(); cur_ax.plot(xs, ys, '-o', color='black', markersize=2); cur_ax.set_xlabel('Current(A)'); cur_ax.set_ylabel('Voltage(V)'); cur_ax.set_title(f'Current IV Curve @ {T_now:.3f}K SMU2'); cur_fig.canvas.draw_idle()
+                                c = cmap(min(1.0, max(0.0, T_now/300.0))); smu2_ax.plot(xs, ys, '-', color=c, alpha=0.9); smu2_fig.canvas.draw_idle()
+                            alt['next'] = 1
                     elif use_smu1.get():
-                        _measure_curve(k, mode, levels, rt1, T_now)
+                        xs, ys = _measure_curve(k, mode, levels, rt1, T_now)
                     elif use_smu2.get():
-                        _measure_curve(k2, mode, levels, rt2l, T_now)
+                        xs, ys = _measure_curve(k2, mode, levels, rt2l, T_now)
 
             if stop5k.get():
                 temperature_control.start((5.0, 5.0))
