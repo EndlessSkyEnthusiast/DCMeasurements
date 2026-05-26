@@ -7204,7 +7204,9 @@ def TempSweepIV():
                 else:
                     adr_control.start_adr(setpoint=target_t, ramp=ramp, adr_mode=None, operation_mode='cadr', auto_regenerate=True, pre_regenerate=bool(regen))
 
-                while abs(float(client.query('T_sample.kelvin') or 300.0) - target_t) > (0.05 if target_t > 3 else 0.02):
+                target_tol = min(0.1, 0.05 * abs(float(target_t)))
+                target_tol = max(target_tol, 1e-6)
+                while abs(float(client.query('T_sample.kelvin') or 300.0) - target_t) > target_tol:
                     T_now = float(client.query('T_sample.kelvin') or 300.0)
                     section_done = min(section_total_path, abs(section_start_t - T_now))
                     traveled = completed_temp_path + section_done
@@ -7284,13 +7286,13 @@ def TempSweepIV():
                         _save_curve_incremental(run_folder_backup, "SMU2", curve_idx['SMU2'], times, xs, ys, T_now, base_smu2, section_start_t, target_t)
                         if wait_between_curves_s > 0: time.sleep(wait_between_curves_s)
 
-                if rt1 is not None and rt1.data:
+                if rt1 is not None and len(rt1.data) > 0:
                     new_rows_1 = rt1.data[saved_rows['SMU1']:]
                     if new_rows_1:
                         d1 = np.array([[ts] + list(map(float, vals)) for ts, *vals in new_rows_1], dtype=object)
                         safe_file(d1, f"{base_smu1}_SMU1_{range_tag}")
                         saved_rows['SMU1'] = len(rt1.data)
-                if rt2l is not None and rt2l.data:
+                if rt2l is not None and len(rt2l.data) > 0:
                     new_rows_2 = rt2l.data[saved_rows['SMU2']:]
                     if new_rows_2:
                         d2 = np.array([[ts] + list(map(float, vals)) for ts, *vals in new_rows_2], dtype=object)
