@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-Refactored DC measurement GUI for Kiutra + Keithley 2636A.
+Refactored DC measurement GUI for Kiutra + Keithley 2636A. Made By Benedikt Schoof
+
 
 The old Main.py grew organically.  This file keeps the important hardware
 semantics, but separates settings, cryostat control, saving, plotting and the
@@ -15,6 +16,7 @@ import json
 import math
 import os
 import queue
+import re
 import signal
 import sys
 import threading
@@ -117,6 +119,87 @@ DEFAULT_SAVE_PATH = (
 )
 DEFAULT_BACKUP_PATH = "C:/Users/ge36kuc/Desktop/SafesBackup"
 
+INFO_TEXT = """General settings
+
+SMU On/Off:
+  Selects whether SMU1 or SMU2 is used for the next measurement.
+
+2 Point / 4 Point:
+  Selects local sense or remote sense. 4 Point uses the sense terminals of the selected SMU.
+
+Source Voltage mV / Source Current uA:
+  Selects the sourced quantity. The routines measure the complementary quantity:
+  current source measures voltage, voltage source measures current.
+
+Parallel / Sequential:
+  Parallel sets both active SMUs to the next setpoint, waits once, and then reads both channels.
+  When both channels belong to the same Keithley 2636A, this is attempted as one TSP command.
+  Sequential measures the full SMU1 sequence first and then the full SMU2 sequence.
+
+Current Limit / Voltage Limit:
+  Empty fields leave the current SMU settings unchanged. Entered values are applied when a measurement starts.
+
+Put Header:
+  Writes the most important settings into the first line of the TXT save files.
+
+NPLC:
+  Empty field keeps the current SMU value. Smaller values are faster, larger values are lower noise.
+
+Autozero:
+  Once performs one autozero before a measurement run. Automatic keeps autozero active.
+  Now performs one autozero immediately.
+
+Jitter:
+  For cyclic measurements, the first cycle stays exactly nominal. Later cycles randomly move inner points
+  by up to 50 percent of the local point spacing. Zero and the positive/negative extrema stay exact.
+
+Fast Cooldown:
+  If the current temperature is above 7 K and the target is below 5 K, TemperatureControl is stopped and
+  the sample heat switch is closed best-effort. Below 5 K, the normal target control is started.
+
+Measurements
+
+Simple DC:
+  Manual sweep segments with Min, Max, and Steps. SMU modes and limits come from General settings.
+
+Cyclic DC:
+  Measures 0 -> +Max -> 0 -> -Max -> 0. Empty Cycles or 0 runs until Save Now.
+  In Parallel mode, both SMUs are set together for each sweep point and then read out.
+  In continuous mode, shorter active SMU cycles repeat so they can keep running while the longer cycle finishes.
+
+Tc Measurement:
+  Can only be started when all active SMUs are current sources. Applies a constant current and measures voltage
+  while the target temperatures are approached.
+
+IVTemp continuous:
+  Measures IV sweeps continuously until the respective temperature checkpoints are reached.
+
+IVTemp at Temperatures:
+  Moves to each target temperature, waits for the stabilization time, and then measures the IV curve.
+
+Find JJ:
+  Searches Ic with a soft current ramp and then performs a finer sweep around Ic.
+
+TempJJ continuous:
+  Performs Find JJ once at the beginning and then only fine sweeps. If the threshold is no longer crossed,
+  a full Find-JJ run is performed again.
+
+TempJJ at Temperatures:
+  Moves to temperature points and performs Find JJ at each point.
+
+Fraunhofer Pattern:
+  SMU1 searches Ic, SMU2 applies the coil current. The conversion factor converts SMU2 current into expected field.
+
+Plots
+
+Live Plot:
+  X, Y, and Color can be selected freely. Auto scales to the visible data range and chooses suitable units
+  such as nA, uA, mV, or uV. Est shows a dynamic remaining-time estimate once enough data points are available.
+
+Session Plots:
+  Show all points measured since program start for each SMU. Reset hides older points without deleting data.
+"""
+
 SOURCE_CURRENT = "current"
 SOURCE_VOLTAGE = "voltage"
 SEQUENCE_PARALLEL = "parallel"
@@ -130,6 +213,110 @@ PLOT_FIELD_KEYS = {
     "Temperature": "temperature",
     "Magnetic Field": "magnetic_field",
 }
+SMU_COLORS = {"SMU1": "#1f77b4", "SMU2": "#d62728"}
+
+
+def fit_window_to_content(
+    window: tk.Misc,
+    min_w: int = 260,
+    min_h: int = 140,
+    max_w: int = 980,
+    max_h: int = 760,
+    x: Optional[int] = None,
+    y: Optional[int] = None,
+) -> None:
+    try:
+        window.update_idletasks()
+        width = max(min_w, min(max_w, window.winfo_reqwidth() + 12))
+        height = max(min_h, min(max_h, window.winfo_reqheight() + 12))
+        if x is None:
+            x = max(0, window.winfo_x())
+        if y is None:
+            y = max(0, window.winfo_y())
+        window.geometry(f"{width}x{height}+{x}+{y}")
+        window.minsize(min_w, min_h)
+    except Exception:
+        pass
+
+
+def refit_parent_window(widget: tk.Widget) -> None:
+    try:
+        top = widget.winfo_toplevel()
+        screen_h = max(360, top.winfo_screenheight() - 80)
+        fit_window_to_content(top, min_w=top.winfo_width(), min_h=top.winfo_height(), max_w=1120, max_h=screen_h)
+    except Exception:
+        pass
+
+
+def format_duration(seconds: Optional[float]) -> str:
+    if seconds is None or not is_number(seconds) or seconds < 0:
+        return "--:--:--"
+    total = int(seconds)
+    h, rem = divmod(total, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
+
+def choose_axis_scale(field: str, values: Sequence[float]) -> Tuple[float, str]:
+    finite = [abs(float(v)) for v in values if is_number(v)]
+    max_abs = max(finite) if finite else 0.0
+    if field == "Current":
+        units = [(1.0, "A"), (1e-3, "mA"), (1e-6, "uA"), (1e-9, "nA"), (1e-12, "pA")]
+    elif field == "Voltage":
+        units = [(1.0, "V"), (1e-3, "mV"), (1e-6, "uV"), (1e-9, "nV")]
+    elif field == "Time":
+        if max_abs >= 3600:
+            return 3600.0, "h"
+        if max_abs >= 120:
+            return 60.0, "min"
+        return 1.0, "s"
+    elif field == "Temperature":
+        return 1.0, "K"
+    elif field == "Magnetic Field":
+        return 1.0, "arb."
+    else:
+        return 1.0, ""
+    for factor, unit in units:
+        if max_abs >= factor:
+            return factor, unit
+    return units[-1]
+
+
+def raw_values(rows: Sequence[Dict[str, Any]], field: str) -> List[float]:
+    key = PLOT_FIELD_KEYS[field]
+    out = []
+    for row in rows:
+        val = row.get(key, float("nan"))
+        out.append(float(val) if is_number(val) else float("nan"))
+    return out
+
+
+def scaled_values(rows: Sequence[Dict[str, Any]], field: str) -> Tuple[List[float], str, float]:
+    raw = raw_values(rows, field)
+    factor, unit = choose_axis_scale(field, raw)
+    factor = factor or 1.0
+    return [(v / factor if is_number(v) else float("nan")) for v in raw], f"{field} [{unit}]", factor
+
+
+def padded_limits(values: Sequence[float]) -> Optional[Tuple[float, float]]:
+    finite = [float(v) for v in values if is_number(v)]
+    if not finite:
+        return None
+    lo, hi = min(finite), max(finite)
+    if abs(hi - lo) < 1e-15:
+        pad = max(abs(lo) * 0.05, 1.0)
+    else:
+        pad = (hi - lo) * 0.05
+    return lo - pad, hi + pad
+
+
+def apply_auto_limits(ax: Any, xs: Sequence[float], ys: Sequence[float]) -> None:
+    xlim = padded_limits(xs)
+    ylim = padded_limits(ys)
+    if xlim:
+        ax.set_xlim(*xlim)
+    if ylim:
+        ax.set_ylim(*ylim)
 
 
 def now_stamp() -> str:
@@ -225,6 +412,26 @@ def cyclic_levels(max_abs: float, steps: int) -> List[float]:
     return [float(x) for x in np.concatenate(parts)]
 
 
+def jitter_nominal_levels(levels: Sequence[float], fraction: float = 0.5) -> List[float]:
+    if len(levels) <= 2:
+        return [float(v) for v in levels]
+    values = [float(v) for v in levels]
+    max_abs = max(abs(v) for v in values)
+    out = values[:]
+    eps = max(max_abs * 1e-12, 1e-18)
+    for idx in range(1, len(values) - 1):
+        val = values[idx]
+        if abs(val) <= eps or abs(abs(val) - max_abs) <= eps:
+            continue
+        prev_delta = abs(val - values[idx - 1])
+        next_delta = abs(values[idx + 1] - val)
+        nominal_delta = min(d for d in (prev_delta, next_delta) if d > eps) if (prev_delta > eps or next_delta > eps) else 0.0
+        if nominal_delta <= 0:
+            continue
+        out[idx] = val + float(np.random.uniform(-fraction * nominal_delta, fraction * nominal_delta))
+    return out
+
+
 def center_out(values: Sequence[float]) -> List[float]:
     return sorted([float(v) for v in values], key=lambda x: (abs(x), x < 0, x))
 
@@ -247,6 +454,13 @@ class GeneralConfig:
     put_header: bool = True
     nplc: Optional[float] = None
     autozero: str = "Once"
+    jitter: bool = False
+    autorange_voltage: bool = True
+    voltage_range_smu1_mV: Optional[float] = None
+    voltage_range_smu2_mV: Optional[float] = None
+    autorange_current: bool = True
+    current_range_smu1_uA: Optional[float] = None
+    current_range_smu2_uA: Optional[float] = None
     save_path: str = DEFAULT_SAVE_PATH
     backup_path: str = DEFAULT_BACKUP_PATH
     fast_cooldown: bool = True
@@ -256,10 +470,28 @@ class GeneralConfig:
         cfg = GeneralConfig()
         if not isinstance(data, dict):
             return cfg
-        for key in ("sequence", "put_header", "nplc", "autozero", "save_path", "backup_path", "fast_cooldown"):
+        for key in (
+            "sequence",
+            "put_header",
+            "nplc",
+            "autozero",
+            "jitter",
+            "autorange_voltage",
+            "autorange_current",
+            "save_path",
+            "backup_path",
+            "fast_cooldown",
+        ):
             if key in data:
                 setattr(cfg, key, data[key])
-        for key in ("current_limit", "voltage_limit"):
+        for key in (
+            "current_limit",
+            "voltage_limit",
+            "voltage_range_smu1_mV",
+            "voltage_range_smu2_mV",
+            "current_range_smu1_uA",
+            "current_range_smu2_uA",
+        ):
             value = data.get(key)
             setattr(cfg, key, None if value in ("", None) else float(value))
         for name in ("smu1", "smu2"):
@@ -369,8 +601,8 @@ class Hardware:
             self.errors.append(f"ConnectKiutra failed: {exc}")
         try:
             self.keithley = ConnectKeithley_ASRL5_TSP()
-            self.smu1 = SMUDevice("SMU1", self.keithley, self.keithley.smua)
-            self.smu2 = SMUDevice("SMU2", self.keithley, self.keithley.smub)
+            self.smu1 = SMUDevice("SMU1", self.keithley, self.keithley.smua, "smua")
+            self.smu2 = SMUDevice("SMU2", self.keithley, self.keithley.smub, "smub")
             self.output_off_all()
             for smu in self.active_smus({"SMU1": True, "SMU2": True}):
                 smu.set_autozero("Once")
@@ -428,12 +660,14 @@ class Hardware:
 
 
 class SMUDevice:
-    def __init__(self, name: str, instrument: Any, channel: Any):
+    def __init__(self, name: str, instrument: Any, channel: Any, tsp_channel: Optional[str] = None):
         self.name = name
         self.instrument = instrument
         self.channel = channel
+        self.tsp_channel = tsp_channel
 
-    def configure(self, smu_cfg: SMUConfig, general: GeneralConfig) -> None:
+    def configure(self, smu_cfg: SMUConfig, general: GeneralConfig) -> List[str]:
+        warnings: List[str] = []
         try:
             self.channel.sense = self.channel.SENSE_REMOTE if smu_cfg.four_point else self.channel.SENSE_LOCAL
         except Exception:
@@ -453,7 +687,39 @@ class SMUDevice:
                 self.channel.source.limitv = float(general.voltage_limit)
             except Exception:
                 pass
+        self._configure_voltage_source_range(general, warnings)
+        self._configure_current_measure_range(general, warnings)
         self.set_source_mode(smu_cfg.source_mode)
+        return warnings
+
+    def _warn_config(self, warnings: List[str], setting: str, exc: Exception) -> None:
+        warnings.append(f"{self.name}: {setting} was not applied ({exc})")
+
+    def _configure_voltage_source_range(self, general: GeneralConfig, warnings: List[str]) -> None:
+        try:
+            if general.autorange_voltage:
+                self.channel.source.autorangev = self.channel.AUTORANGE_ON
+                return
+            range_mV = general.voltage_range_smu1_mV if self.name == "SMU1" else general.voltage_range_smu2_mV
+            if range_mV is None:
+                return
+            self.channel.source.autorangev = self.channel.AUTORANGE_OFF
+            self.channel.source.rangev = float(range_mV) * 1e-3
+        except Exception as exc:
+            self._warn_config(warnings, "voltage source autorange/range", exc)
+
+    def _configure_current_measure_range(self, general: GeneralConfig, warnings: List[str]) -> None:
+        try:
+            if general.autorange_current:
+                self.channel.measure.autorangei = self.channel.AUTORANGE_ON
+                return
+            range_uA = general.current_range_smu1_uA if self.name == "SMU1" else general.current_range_smu2_uA
+            if range_uA is None:
+                return
+            self.channel.measure.autorangei = self.channel.AUTORANGE_OFF
+            self.channel.measure.rangei = float(range_uA) * 1e-6
+        except Exception as exc:
+            self._warn_config(warnings, "current measure autorange/range", exc)
 
     def set_autozero(self, mode: str) -> None:
         try:
@@ -688,6 +954,13 @@ class TextSaver:
             f"sequence={general.get('sequence')}",
             f"nplc={general.get('nplc')}",
             f"autozero={general.get('autozero')}",
+            f"jitter={general.get('jitter')}",
+            f"autorange_voltage={general.get('autorange_voltage')}",
+            f"voltage_range_smu1_mV={general.get('voltage_range_smu1_mV')}",
+            f"voltage_range_smu2_mV={general.get('voltage_range_smu2_mV')}",
+            f"autorange_current={general.get('autorange_current')}",
+            f"current_range_smu1_uA={general.get('current_range_smu1_uA')}",
+            f"current_range_smu2_uA={general.get('current_range_smu2_uA')}",
             f"current_limit={general.get('current_limit')}",
             f"voltage_limit={general.get('voltage_limit')}",
             f"settings={measurement_settings}",
@@ -737,6 +1010,8 @@ class MeasurementRun:
         self.saved = False
         self.save_now_requested = False
         self.error: Optional[str] = None
+        self.estimated_total_points: Optional[int] = None
+        self.estimated_total_seconds: Optional[float] = None
         self.live_plot = LiveMeasurementPlot(app, self) if create_live_plot else None
 
     def add_point(
@@ -803,6 +1078,22 @@ class MeasurementRun:
         self.skip_temperature_event.set()
         self.app.hardware.output_off_all()
 
+    def set_estimate(self, total_points: Optional[int], total_seconds: Optional[float]) -> None:
+        self.estimated_total_points = total_points
+        self.estimated_total_seconds = total_seconds
+
+    def eta_text(self) -> str:
+        rows_done = len(self.rows_snapshot())
+        if self.estimated_total_points and self.estimated_total_points > 0:
+            remaining_points = max(0, self.estimated_total_points - rows_done)
+            if rows_done > 0:
+                seconds_per_point = (time.time() - self.start_time) / max(1, rows_done)
+                return format_duration(remaining_points * seconds_per_point)
+            return "--:--:--"
+        if self.estimated_total_seconds is not None:
+            return format_duration(max(0.0, self.estimated_total_seconds - (time.time() - self.start_time)))
+        return "--:--:--"
+
     def save(self) -> List[str]:
         if self.saved:
             return self.saved_paths
@@ -820,16 +1111,20 @@ class LiveMeasurementPlot:
         self.run = run
         self.window = tk.Toplevel(app.root)
         self.window.title(f"Live Plot - {run.name}")
-        self.window.geometry("760x560+360+140")
         self.window.protocol("WM_DELETE_WINDOW", self.window.destroy)
 
         control = ttk.Frame(self.window)
         control.pack(fill=tk.X, padx=8, pady=6)
+        row1 = ttk.Frame(control)
+        row1.pack(fill=tk.X)
+        row2 = ttk.Frame(control)
+        row2.pack(fill=tk.X, pady=(4, 0))
         self.x_var = tk.StringVar(value="Current")
         self.y_var = tk.StringVar(value="Voltage")
         self.color_var = tk.StringVar(value="Off")
         self.style_var = tk.StringVar(value="scatter")
         self.scale_var = tk.StringVar(value="auto")
+        self.axis_factors = {"x": 1.0, "y": 1.0}
         for label, var, values in (
             ("X", self.x_var, PLOT_FIELDS),
             ("Y", self.y_var, PLOT_FIELDS),
@@ -837,78 +1132,100 @@ class LiveMeasurementPlot:
             ("Style", self.style_var, ["scatter", "line", "line+scatter"]),
             ("Scale", self.scale_var, ["auto", "manual"]),
         ):
-            ttk.Label(control, text=label).pack(side=tk.LEFT, padx=(8, 2))
-            ttk.Combobox(control, textvariable=var, values=values, width=13, state="readonly").pack(side=tk.LEFT)
+            ttk.Label(row1, text=label).pack(side=tk.LEFT, padx=(8, 2))
+            ttk.Combobox(row1, textvariable=var, values=values, width=13, state="readonly").pack(side=tk.LEFT)
         self.axis_entries: Dict[str, ttk.Entry] = {}
         for label in ("xmin", "xmax", "ymin", "ymax"):
-            ttk.Label(control, text=label).pack(side=tk.LEFT, padx=(6, 2))
-            ent = ttk.Entry(control, width=8)
+            ttk.Label(row2, text=label).pack(side=tk.LEFT, padx=(8, 2))
+            ent = ttk.Entry(row2, width=9)
             ent.pack(side=tk.LEFT)
             self.axis_entries[label] = ent
+        self.estimate_label = ttk.Label(row2, text="Est: --:--:--")
+        self.estimate_label.pack(side=tk.LEFT, padx=(18, 2))
 
-        self.fig = Figure(figsize=(7.2, 4.8), dpi=100)
+        self.fig = Figure(figsize=(6.6, 4.2), dpi=100)
         self.ax = self.fig.add_subplot(111)
         self.canvas = FigureCanvasTkAgg(self.fig, master=self.window)
         self.canvas.draw()
         self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True, padx=8, pady=6)
         for var in (self.x_var, self.y_var, self.color_var, self.style_var, self.scale_var):
             var.trace_add("write", lambda *_: self.redraw())
+        fit_window_to_content(self.window, min_w=680, min_h=470, max_w=820, max_h=620, x=360, y=140)
+        self.redraw()
 
     def redraw(self) -> None:
         if not self.window.winfo_exists():
             return
         rows = self.run.rows_snapshot()
-        self._clear_extra_axes()
-        self.ax.cla()
-        self.ax.set_xlabel(self.x_var.get())
-        self.ax.set_ylabel(self.y_var.get())
+        self._reset_axes()
+        self.estimate_label.configure(text=f"Est: {self.run.eta_text()}")
+        x_field = self.x_var.get()
+        y_field = self.y_var.get()
+        x_all, x_label, x_factor = scaled_values(rows, x_field)
+        y_all, y_label, y_factor = scaled_values(rows, y_field)
+        self.axis_factors = {"x": x_factor, "y": y_factor}
+        self.ax.set_xlabel(x_label)
+        self.ax.set_ylabel(y_label)
         if not rows:
             self.canvas.draw_idle()
             return
+        color_field = self.color_var.get()
+        c_all: List[float] = []
+        c_label = ""
+        c_limits = None
+        mappable = None
+        if color_field != "Off":
+            c_all, c_label, _ = scaled_values(rows, color_field)
+            c_limits = padded_limits(c_all)
         for smu_name, marker in (("SMU1", "o"), ("SMU2", "s")):
-            sub = [r for r in rows if r.get("smu") == smu_name]
-            if not sub:
+            idxs = [idx for idx, row in enumerate(rows) if row.get("smu") == smu_name]
+            if not idxs:
                 continue
-            x = self._values(sub, self.x_var.get())
-            y = self._values(sub, self.y_var.get())
+            x = [x_all[idx] for idx in idxs]
+            y = [y_all[idx] for idx in idxs]
             style = self.style_var.get()
-            color_field = self.color_var.get()
             if color_field != "Off":
-                c = self._values(sub, color_field)
-                sc = self.ax.scatter(x, y, c=c, s=18, marker=marker, label=smu_name)
-                try:
-                    self.fig.colorbar(sc, ax=self.ax, label=color_field)
-                except Exception:
-                    pass
+                c = [c_all[idx] for idx in idxs]
+                kwargs = {}
+                if c_limits:
+                    kwargs.update({"vmin": c_limits[0], "vmax": c_limits[1]})
+                sc = self.ax.scatter(
+                    x,
+                    y,
+                    c=c,
+                    s=22,
+                    marker=marker,
+                    cmap="viridis",
+                    edgecolors=SMU_COLORS.get(smu_name, "black"),
+                    linewidths=0.7,
+                    label=smu_name,
+                    **kwargs,
+                )
+                if mappable is None:
+                    mappable = sc
                 if style in ("line", "line+scatter"):
-                    self.ax.plot(x, y, linewidth=0.8, alpha=0.5)
+                    self.ax.plot(x, y, linewidth=0.8, alpha=0.5, color=SMU_COLORS.get(smu_name))
             elif style == "line":
-                self.ax.plot(x, y, marker="", label=smu_name)
+                self.ax.plot(x, y, marker="", label=smu_name, color=SMU_COLORS.get(smu_name))
             elif style == "line+scatter":
-                self.ax.plot(x, y, marker=marker, markersize=3, label=smu_name)
+                self.ax.plot(x, y, marker=marker, markersize=3, label=smu_name, color=SMU_COLORS.get(smu_name))
             else:
-                self.ax.scatter(x, y, s=18, marker=marker, label=smu_name)
+                self.ax.scatter(x, y, s=22, marker=marker, label=smu_name, color=SMU_COLORS.get(smu_name))
+        if mappable is not None:
+            try:
+                self.fig.colorbar(mappable, ax=self.ax, label=c_label)
+            except Exception:
+                pass
         if self.scale_var.get() == "manual":
             self._apply_manual_limits()
         else:
-            self.ax.relim()
-            self.ax.autoscale_view()
+            apply_auto_limits(self.ax, x_all, y_all)
         self.ax.legend(loc="best")
         self.canvas.draw_idle()
 
-    def _clear_extra_axes(self) -> None:
-        for extra_ax in list(self.fig.axes[1:]):
-            self.fig.delaxes(extra_ax)
-        if self.fig.axes:
-            self.ax = self.fig.axes[0]
-
-    def _values(self, rows: Sequence[Dict[str, Any]], field: str) -> List[float]:
-        key = PLOT_FIELD_KEYS[field]
-        out = []
-        for row in rows:
-            val = row.get(key, float("nan"))
-            out.append(float(val) if is_number(val) else float("nan"))
-        return out
+    def _reset_axes(self) -> None:
+        self.fig.clear()
+        self.ax = self.fig.add_subplot(111)
 
     def _apply_manual_limits(self) -> None:
         try:
@@ -944,7 +1261,6 @@ class SessionPlotWindow:
         self.closed_by_user = False
         self.window = tk.Toplevel(self.app.root)
         self.window.title(f"Session Plot - {self.smu_name}")
-        self.window.geometry("700x460")
         self.window.protocol("WM_DELETE_WINDOW", self.on_close)
         ctl = ttk.Frame(self.window)
         ctl.pack(fill=tk.X, padx=8, pady=5)
@@ -957,13 +1273,14 @@ class SessionPlotWindow:
             ttk.Label(ctl, text=label).pack(side=tk.LEFT, padx=(8, 2))
             ttk.Combobox(ctl, textvariable=var, values=values, width=13, state="readonly").pack(side=tk.LEFT)
         ttk.Button(ctl, text="Reset", command=self.reset).pack(side=tk.RIGHT)
-        self.fig = Figure(figsize=(6.6, 4.0), dpi=100)
+        self.fig = Figure(figsize=(6.0, 3.6), dpi=100)
         self.ax = self.fig.add_subplot(111)
         self.canvas = FigureCanvasTkAgg(self.fig, master=self.window)
         self.canvas.draw()
         self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True, padx=8, pady=6)
         for var in (self.x_var, self.y_var, self.color_var, self.style_var):
             var.trace_add("write", lambda *_: self.redraw())
+        fit_window_to_content(self.window, min_w=620, min_h=420, max_w=760, max_h=560)
         self.redraw()
 
     def on_close(self) -> None:
@@ -981,42 +1298,42 @@ class SessionPlotWindow:
         if not self.window or not self.window.winfo_exists() or self.ax is None:
             return
         rows = self.app.session_rows.get(self.smu_name, [])[self.reset_index :]
-        self._clear_extra_axes()
-        self.ax.cla()
+        self._reset_axes()
         self.ax.set_title(self.smu_name)
-        self.ax.set_xlabel(self.x_var.get())
-        self.ax.set_ylabel(self.y_var.get())
+        x, x_label, _ = scaled_values(rows, self.x_var.get())
+        y, y_label, _ = scaled_values(rows, self.y_var.get())
+        self.ax.set_xlabel(x_label)
+        self.ax.set_ylabel(y_label)
         if rows:
-            x = [float(r.get(PLOT_FIELD_KEYS[self.x_var.get()], float("nan"))) for r in rows]
-            y = [float(r.get(PLOT_FIELD_KEYS[self.y_var.get()], float("nan"))) for r in rows]
             style = self.style_var.get()
             color_field = self.color_var.get()
             if color_field != "Off":
-                c = [float(r.get(PLOT_FIELD_KEYS[color_field], float("nan"))) for r in rows]
-                sc = self.ax.scatter(x, y, c=c, s=16)
+                c, c_label, _ = scaled_values(rows, color_field)
+                c_limits = padded_limits(c)
+                kwargs = {}
+                if c_limits:
+                    kwargs.update({"vmin": c_limits[0], "vmax": c_limits[1]})
+                sc = self.ax.scatter(x, y, c=c, s=18, cmap="viridis", **kwargs)
                 try:
-                    self.fig.colorbar(sc, ax=self.ax, label=color_field)
+                    self.fig.colorbar(sc, ax=self.ax, label=c_label)
                 except Exception:
                     pass
                 if style in ("line", "line+scatter"):
-                    self.ax.plot(x, y, linewidth=0.8, alpha=0.5)
+                    self.ax.plot(x, y, linewidth=0.8, alpha=0.5, color=SMU_COLORS.get(self.smu_name))
             elif style == "line":
-                self.ax.plot(x, y)
+                self.ax.plot(x, y, color=SMU_COLORS.get(self.smu_name))
             elif style == "line+scatter":
-                self.ax.plot(x, y, marker="o", markersize=3)
+                self.ax.plot(x, y, marker="o", markersize=3, color=SMU_COLORS.get(self.smu_name))
             else:
-                self.ax.scatter(x, y, s=16)
-            self.ax.relim()
-            self.ax.autoscale_view()
+                self.ax.scatter(x, y, s=18, color=SMU_COLORS.get(self.smu_name))
+            apply_auto_limits(self.ax, x, y)
         self.canvas.draw_idle()
 
-    def _clear_extra_axes(self) -> None:
+    def _reset_axes(self) -> None:
         if self.fig is None:
             return
-        for extra_ax in list(self.fig.axes[1:]):
-            self.fig.delaxes(extra_ax)
-        if self.fig.axes:
-            self.ax = self.fig.axes[0]
+        self.fig.clear()
+        self.ax = self.fig.add_subplot(111)
 
 
 class TemperaturePlotWindow:
@@ -1032,18 +1349,18 @@ class TemperaturePlotWindow:
         self.app.temperature_history.clear()
         self.window = tk.Toplevel(self.app.root)
         self.window.title("Temperature")
-        self.window.geometry("700x420+40+520")
         self.window.protocol("WM_DELETE_WINDOW", self.on_close)
         ctl = ttk.Frame(self.window)
         ctl.pack(fill=tk.X, padx=8, pady=5)
         ttk.Button(ctl, text="Reset", command=self.reset).pack(side=tk.RIGHT)
-        self.fig = Figure(figsize=(6.8, 3.8), dpi=100)
+        self.fig = Figure(figsize=(6.0, 3.4), dpi=100)
         self.ax = self.fig.add_subplot(111)
         self.ax.set_xlabel("Time [s]")
         self.ax.set_ylabel("Temperature [K]")
         self.canvas = FigureCanvasTkAgg(self.fig, master=self.window)
         self.canvas.draw()
         self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True, padx=8, pady=6)
+        fit_window_to_content(self.window, min_w=620, min_h=390, max_w=760, max_h=520, x=40, y=520)
 
     def on_close(self) -> None:
         self.reset()
@@ -1066,8 +1383,7 @@ class TemperaturePlotWindow:
             xs = [p[0] for p in self.app.temperature_history]
             ys = [p[1] for p in self.app.temperature_history]
             self.ax.plot(xs, ys, marker="o", markersize=2, linewidth=0.8)
-            self.ax.relim()
-            self.ax.autoscale_view()
+            apply_auto_limits(self.ax, xs, ys)
         self.canvas.draw_idle()
 
 
@@ -1152,7 +1468,6 @@ class MeasurementWindowBase:
         self.app = app
         self.window = tk.Toplevel(app.root)
         self.window.title(self.title)
-        self.window.geometry("760x620")
         self.window.protocol("WM_DELETE_WINDOW", self.on_close)
         self.body = ttk.Frame(self.window)
         self.body.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
@@ -1167,6 +1482,7 @@ class MeasurementWindowBase:
         self.start_button.configure(command=self.on_start)
         self.app.coordinator.register_start(self.start_button, self.start_validator)
         self.build()
+        fit_window_to_content(self.window, min_w=420, min_h=220, max_w=980, max_h=760, x=420, y=80)
         self.window.after(1000, self._refresh_loop)
 
     def build(self) -> None:
@@ -1195,6 +1511,9 @@ class MeasurementWindowBase:
     def save_kind(self) -> str:
         return "standard"
 
+    def update_local_estimate(self) -> None:
+        pass
+
     def save_now(self) -> None:
         self.app.coordinator.save_now()
 
@@ -1206,6 +1525,7 @@ class MeasurementWindowBase:
         self.window.destroy()
 
     def _refresh_loop(self) -> None:
+        self.update_local_estimate()
         self.app.coordinator.refresh_buttons()
         if self.window.winfo_exists():
             self.window.after(1000, self._refresh_loop)
@@ -1215,17 +1535,17 @@ class SegmentEditor(ttk.LabelFrame):
     def __init__(self, master: tk.Widget, title: str, unit_getter: Callable[[], str], values: List[Dict[str, Any]]):
         super().__init__(master, text=title)
         self.unit_getter = unit_getter
+        btns = ttk.Frame(self)
+        btns.pack(fill=tk.X, padx=4, pady=(4, 0))
+        ttk.Button(btns, text="Add", command=lambda: self.add_row({"min": "0", "max": "100", "steps": "51"})).pack(
+            side=tk.LEFT
+        )
+        ttk.Button(btns, text="Remove", command=self.remove_row).pack(side=tk.LEFT, padx=4)
         self.rows_frame = ttk.Frame(self)
         self.rows_frame.pack(fill=tk.X, padx=4, pady=4)
         self.rows: List[Tuple[ttk.Frame, ttk.Entry, ttk.Entry, ttk.Entry]] = []
         for row in values or [{"min": "0", "max": "100", "steps": "51"}]:
             self.add_row(row)
-        btns = ttk.Frame(self)
-        btns.pack(fill=tk.X, padx=4, pady=(0, 4))
-        ttk.Button(btns, text="Add", command=lambda: self.add_row({"min": "0", "max": "100", "steps": "51"})).pack(
-            side=tk.LEFT
-        )
-        ttk.Button(btns, text="Remove", command=self.remove_row).pack(side=tk.LEFT, padx=4)
 
     def add_row(self, data: Dict[str, Any]) -> None:
         idx = len(self.rows)
@@ -1245,12 +1565,14 @@ class SegmentEditor(ttk.LabelFrame):
         e_steps.insert(0, str(data.get("steps", "51")))
         e_steps.grid(row=0, column=6, padx=3)
         self.rows.append((frame, e_min, e_max, e_steps))
+        self.after_idle(lambda: refit_parent_window(self))
 
     def remove_row(self) -> None:
         if len(self.rows) <= 1:
             return
         frame, *_ = self.rows.pop()
         frame.destroy()
+        self.after_idle(lambda: refit_parent_window(self))
 
     def get_segments(self) -> List[Dict[str, Any]]:
         out = []
@@ -1307,6 +1629,8 @@ class SimpleDCWindow(MeasurementWindowBase):
         settings = run.measurement_settings
         settle = max(0.0, float(settings["settle_ms"]) * 1e-3)
         plans = build_segment_plans(run.snapshot, settings)
+        points, _ = estimate_sweep_from_plans(run.snapshot, plans, settle)
+        run.set_estimate(points, None)
         execute_sweep_plans(self.app, run, plans, settle)
 
 
@@ -1351,34 +1675,55 @@ class CyclicDCWindow(MeasurementWindowBase):
             max_si = unit_to_si(cfg["source_mode"], float(s[key]))
             one_cycle = cyclic_levels(max_si, steps)
             one_cycle_plans[smu_name] = one_cycle
+        jitter_on = bool(run.snapshot["general"].get("jitter"))
+        if cycles > 0:
+            row_count, _ = estimate_sweep_from_plans(
+                run.snapshot,
+                {name: levels * cycles for name, levels in one_cycle_plans.items()},
+                settle,
+            )
+            run.set_estimate(row_count, None)
         if run.snapshot["general"]["sequence"] == SEQUENCE_SEQUENTIAL:
             completed = 0
             while not run.stop_event.is_set() and (cycles <= 0 or completed < cycles):
                 for smu_name in ("SMU1", "SMU2"):
-                    execute_one_smu_plan(self.app, run, smu_name, one_cycle_plans.get(smu_name, []), settle)
+                    levels = one_cycle_plans.get(smu_name, [])
+                    if jitter_on and completed > 0:
+                        levels = jitter_nominal_levels(levels)
+                    execute_one_smu_plan(self.app, run, smu_name, levels, settle)
                 completed += 1
             return
         if cycles <= 0:
+            completed = 0
             while not run.stop_event.is_set():
-                execute_sweep_plans(self.app, run, one_cycle_plans, settle)
+                plans = one_cycle_plans
+                if jitter_on and completed > 0:
+                    plans = {name: jitter_nominal_levels(levels) for name, levels in one_cycle_plans.items()}
+                execute_sweep_plans(self.app, run, plans, settle, repeat_shorter=True)
+                completed += 1
         else:
-            plans = {name: levels * cycles for name, levels in one_cycle_plans.items()}
-            execute_sweep_plans(self.app, run, plans, settle)
+            for cycle_idx in range(cycles):
+                if run.stop_event.is_set():
+                    break
+                plans = one_cycle_plans
+                if jitter_on and cycle_idx > 0:
+                    plans = {name: jitter_nominal_levels(levels) for name, levels in one_cycle_plans.items()}
+                execute_sweep_plans(self.app, run, plans, settle)
 
 
 class TemperatureTargetEditor(ttk.LabelFrame):
     def __init__(self, master: tk.Widget, values: List[Dict[str, Any]], with_stable: bool = False):
         super().__init__(master, text="Temperature Targets")
         self.with_stable = with_stable
+        btns = ttk.Frame(self)
+        btns.pack(fill=tk.X, padx=4, pady=(4, 0))
+        ttk.Button(btns, text="Add", command=lambda: self.add_row({})).pack(side=tk.LEFT)
+        ttk.Button(btns, text="Remove", command=self.remove_row).pack(side=tk.LEFT, padx=4)
         self.rows_frame = ttk.Frame(self)
         self.rows_frame.pack(fill=tk.X, padx=4, pady=4)
         self.rows: List[Tuple[Any, ...]] = []
         for row in values or [{"target": "4.0", "ramp": "1.0", "pre_regen": "0", "stable_s": "30"}]:
             self.add_row(row)
-        btns = ttk.Frame(self)
-        btns.pack(fill=tk.X, padx=4, pady=(0, 4))
-        ttk.Button(btns, text="Add", command=lambda: self.add_row({})).pack(side=tk.LEFT)
-        ttk.Button(btns, text="Remove", command=self.remove_row).pack(side=tk.LEFT, padx=4)
 
     def add_row(self, data: Dict[str, Any]) -> None:
         frame = ttk.Frame(self.rows_frame)
@@ -1401,12 +1746,14 @@ class TemperatureTargetEditor(ttk.LabelFrame):
             self.rows.append((frame, e_target, e_ramp, regen, e_stable))
         else:
             self.rows.append((frame, e_target, e_ramp, regen))
+        self.after_idle(lambda: refit_parent_window(self))
 
     def remove_row(self) -> None:
         if len(self.rows) <= 1:
             return
         row = self.rows.pop()
         row[0].destroy()
+        self.after_idle(lambda: refit_parent_window(self))
 
     def get_targets(self) -> List[Dict[str, Any]]:
         out = []
@@ -1569,7 +1916,7 @@ class IVTempContinuousWindow(MeasurementWindowBase):
                     break
                 if abs(temp - target["target"]) <= 0.05:
                     break
-                execute_sweep_plans(self.app, run, plans, settle)
+                execute_sweep_plans(self.app, run, plans, settle, repeat_shorter=True)
                 self.set_status(f"T={temp:.3f} K -> {target['target']:.3f} K")
 
 
@@ -1639,6 +1986,7 @@ class FindJJWindow(MeasurementWindowBase):
                 "pretty_overdrive": "1.05",
                 "cycles": "1",
                 "branch": "Positive and Negative",
+                "manual_range_after_first_find": "0",
             },
         )
         self.entries: Dict[str, ttk.Entry] = {}
@@ -1669,6 +2017,12 @@ class FindJJWindow(MeasurementWindowBase):
             state="readonly",
             width=24,
         ).grid(row=len(rows), column=1, sticky="w")
+        self.manual_range_after_first_find = tk.IntVar(value=int(str(d.get("manual_range_after_first_find", "0")) or "0"))
+        ttk.Checkbutton(
+            self.body,
+            text="Set manual current range after first Find-JJ sweep",
+            variable=self.manual_range_after_first_find,
+        ).grid(row=len(rows) + 1, column=0, columnspan=2, sticky="w", pady=(6, 0))
 
     def start_validator(self) -> Tuple[bool, str]:
         bad = []
@@ -1684,6 +2038,7 @@ class FindJJWindow(MeasurementWindowBase):
     def collect(self) -> Dict[str, Any]:
         out = {key: ent.get() for key, ent in self.entries.items()}
         out["branch"] = self.branch_var.get()
+        out["manual_range_after_first_find"] = str(self.manual_range_after_first_find.get())
         return out
 
     def worker(self, run: MeasurementRun) -> None:
@@ -1887,7 +2242,122 @@ def build_segment_plans(snapshot: Dict[str, Any], settings: Dict[str, Any]) -> D
     return plans
 
 
-def execute_sweep_plans(app: "MeasurementApp", run: MeasurementRun, plans: Dict[str, List[float]], settle_s: float) -> None:
+def estimate_sweep_from_plans(
+    snapshot: Dict[str, Any], plans: Dict[str, List[float]], settle_s: float
+) -> Tuple[int, float]:
+    row_count = sum(len(values) for values in plans.values())
+    if snapshot["general"]["sequence"] == SEQUENCE_SEQUENTIAL:
+        setpoint_count = row_count
+    else:
+        setpoint_count = max((len(values) for values in plans.values()), default=0)
+    nplc = snapshot["general"].get("nplc") or 0.0
+    seconds = setpoint_count * (max(0.0, settle_s) + max(0.0, float(nplc)) * 0.02)
+    return row_count, seconds
+
+
+def tsp_send(dev: Any, cmd: str) -> bool:
+    for method_name in ("write", "send", "sendcmd", "execute", "exec", "write_raw"):
+        method = getattr(dev, method_name, None)
+        if callable(method):
+            try:
+                method(cmd)
+                return True
+            except Exception:
+                pass
+    for path in ("visa", "instrument", "resource"):
+        handle = getattr(dev, path, None)
+        if handle is not None and hasattr(handle, "write"):
+            try:
+                handle.write(cmd)
+                return True
+            except Exception:
+                pass
+    return False
+
+
+def tsp_query(dev: Any, cmd: str) -> Optional[str]:
+    for method_name in ("query", "ask"):
+        method = getattr(dev, method_name, None)
+        if callable(method):
+            try:
+                return str(method(cmd))
+            except Exception:
+                pass
+    if tsp_send(dev, cmd):
+        for method_name in ("read", "read_raw"):
+            method = getattr(dev, method_name, None)
+            if callable(method):
+                try:
+                    return str(method())
+                except Exception:
+                    pass
+    for path in ("visa", "instrument", "resource"):
+        handle = getattr(dev, path, None)
+        if handle is not None and hasattr(handle, "query"):
+            try:
+                return str(handle.query(cmd))
+            except Exception:
+                pass
+    return None
+
+
+def parse_tsp_floats(text: Optional[str], expected: int) -> Optional[List[float]]:
+    if text is None:
+        return None
+    tokens = re.findall(r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?|[-+]?nan|[-+]?inf", str(text), re.I)
+    if len(tokens) < expected:
+        return None
+    try:
+        return [float(tok) for tok in tokens[:expected]]
+    except Exception:
+        return None
+
+
+def tsp_source_command(channel: str, source_mode: str, level: float) -> str:
+    func = 2 if source_mode == SOURCE_CURRENT else 1
+    attr = "leveli" if source_mode == SOURCE_CURRENT else "levelv"
+    return f"{channel}.source.output=1; {channel}.source.func={func}; {channel}.source.{attr}={float(level):.17g}"
+
+
+def try_tsp_parallel_dual_point(
+    run: MeasurementRun,
+    requests: Sequence[Tuple[str, SMUDevice, str, float]],
+    settle_s: float,
+) -> bool:
+    if len(requests) != 2:
+        return False
+    (_, dev1, _, _), (_, dev2, _, _) = requests
+    if dev1.instrument is not dev2.instrument:
+        return False
+    if not dev1.tsp_channel or not dev2.tsp_channel:
+        return False
+    cmd_parts = [tsp_source_command(dev.tsp_channel, mode, level) for _, dev, mode, level in requests]
+    if settle_s > 0:
+        cmd_parts.append(f"delay({float(settle_s):.9g})")
+    measure_parts = []
+    for _, dev, _, _ in requests:
+        ch = dev.tsp_channel
+        measure_parts.extend([f"{ch}.measure.v()", f"{ch}.measure.i()"])
+    cmd_parts.append("print(" + ", ".join(measure_parts) + ")")
+    response = tsp_query(dev1.instrument, "; ".join(cmd_parts))
+    values = parse_tsp_floats(response, 4)
+    if values is None:
+        return False
+    temp = run.app.hardware.read_temperature()
+    for idx, (smu_name, _dev, _mode, level) in enumerate(requests):
+        voltage = values[2 * idx]
+        current = values[2 * idx + 1]
+        run.add_point(smu_name, voltage, current, temp, extra={"source_level": level, "parallel_tsp": True})
+    return True
+
+
+def execute_sweep_plans(
+    app: "MeasurementApp",
+    run: MeasurementRun,
+    plans: Dict[str, List[float]],
+    settle_s: float,
+    repeat_shorter: bool = False,
+) -> None:
     sequence = run.snapshot["general"]["sequence"]
     if sequence == SEQUENCE_SEQUENTIAL:
         for smu_name in ("SMU1", "SMU2"):
@@ -1900,14 +2370,20 @@ def execute_sweep_plans(app: "MeasurementApp", run: MeasurementRun, plans: Dict[
             to_measure: List[Tuple[str, SMUDevice, str, float]] = []
             for smu_name in ("SMU1", "SMU2"):
                 levels = plans.get(smu_name, [])
-                if idx >= len(levels):
+                if not levels:
+                    continue
+                if idx >= len(levels) and not repeat_shorter:
                     continue
                 dev = app.hardware.get_smu(smu_name)
                 if not dev:
                     continue
                 mode = run.snapshot["smu"][smu_name]["source_mode"]
-                dev.apply_source(mode, levels[idx])
-                to_measure.append((smu_name, dev, mode, levels[idx]))
+                level = levels[idx % len(levels)] if repeat_shorter else levels[idx]
+                to_measure.append((smu_name, dev, mode, level))
+            if try_tsp_parallel_dual_point(run, to_measure, settle_s):
+                continue
+            for _smu_name, dev, mode, level in to_measure:
+                dev.apply_source(mode, level)
             time.sleep(settle_s)
             temp = app.hardware.read_temperature()
             for smu_name, dev, mode, level in to_measure:
@@ -1945,6 +2421,7 @@ def jj_params(settings: Dict[str, Any]) -> Dict[str, Any]:
         "pretty_overdrive": float(settings["pretty_overdrive"]),
         "cycles": max(1, int(float(settings["cycles"] or "1"))),
         "branch": settings.get("branch", "Positive and Negative"),
+        "manual_range_after_first_find": bool(int(str(settings.get("manual_range_after_first_find", "0") or "0"))),
     }
 
 
@@ -1976,6 +2453,7 @@ def find_jj_full(
     markers: Dict[str, Optional[float]] = {"Ic_plus": None, "Ic_minus": None}
     dev.apply_source(SOURCE_CURRENT, 0.0)
     time.sleep(params["settle_s"])
+    manual_range_set = False
     for sign in branch_signs(params["branch"]):
         seq = soft_ramp_sequence(params["i_start"], params["i_max"], params["grow"], params["min_step"])
         found: Optional[float] = None
@@ -1992,6 +2470,9 @@ def find_jj_full(
         else:
             markers["Ic_minus"] = found
         if found is not None:
+            if params.get("manual_range_after_first_find") and not manual_range_set:
+                apply_jj_post_find_manual_ranges(run, dev, smu_name, abs(found), params)
+                manual_range_set = True
             down = list(reversed(soft_ramp_sequence(params["i_start"], abs(found) * 1e6, params["grow"], params["min_step"])))
             for level_abs in down:
                 if run.stop_event.is_set():
@@ -2002,6 +2483,30 @@ def find_jj_full(
             pretty_jj_sweep(run, dev, smu_name, sign, abs(found), params, coil_device, magnetic_field)
     dev.apply_source(SOURCE_CURRENT, 0.0)
     return markers
+
+
+def apply_jj_post_find_manual_ranges(
+    run: MeasurementRun,
+    dev: SMUDevice,
+    smu_name: str,
+    ic_abs: float,
+    params: Dict[str, Any],
+) -> None:
+    i_range = max(abs(ic_abs) * params["pretty_overdrive"] * 1.25, params["min_step"] * 1e-6, 1e-12)
+    v_range = max(abs(params["v_threshold"]) * 5.0, abs(params["v_retrap"]) * 5.0, 1e-6)
+    warnings: List[str] = []
+    try:
+        dev.channel.measure.autorangei = dev.channel.AUTORANGE_OFF
+        dev.channel.measure.rangei = float(i_range)
+    except Exception as exc:
+        warnings.append(f"{smu_name}: post Find-JJ current measure range was not applied ({exc})")
+    try:
+        dev.channel.source.autorangev = dev.channel.AUTORANGE_OFF
+        dev.channel.source.rangev = float(v_range)
+    except Exception as exc:
+        warnings.append(f"{smu_name}: post Find-JJ voltage source range was not applied ({exc})")
+    if warnings:
+        run.app.root.after(0, lambda text="\n".join(warnings): messagebox.showerror("Keithley configuration", text))
 
 
 def pretty_jj_sweep(
@@ -2092,13 +2597,13 @@ class GeneralSettingsWindow:
     def __init__(self, app: "MeasurementApp"):
         self.app = app
         self.root = app.root
-        self.root.title(APP_TITLE + " - Settings")
-        self.root.geometry("900x430+40+40")
+        self.root.title("Settings")
         self.root.protocol("WM_DELETE_WINDOW", app.shutdown)
         self.vars: Dict[str, Any] = {}
         self.loading = False
         self.build()
         self.refresh_from_state()
+        fit_window_to_content(self.root, min_w=760, min_h=300, max_w=1120, max_h=540, x=40, y=40)
 
     def build(self) -> None:
         main = ttk.Frame(self.root)
@@ -2151,6 +2656,45 @@ class GeneralSettingsWindow:
             lambda _: self.save_to_state(),
         )
         self.fast_cool_seg.grid(row=0, column=4, padx=10, sticky="w")
+        self.jitter_seg = SegmentedControl(
+            other,
+            [("Jitter Off", "0"), ("Jitter On", "1")],
+            "0",
+            lambda _: self.save_to_state(),
+        )
+        self.jitter_seg.grid(row=0, column=5, padx=10, sticky="w")
+
+        ranges = ttk.LabelFrame(main, text="Autorange and Manual Ranges")
+        ranges.pack(fill=tk.X, pady=6)
+        ttk.Label(ranges, text="Autorange Voltage").grid(row=0, column=0, padx=4, pady=4, sticky="e")
+        self.autorange_voltage_seg = SegmentedControl(
+            ranges,
+            [("On", "1"), ("Manual", "0")],
+            "1",
+            lambda _: self.save_to_state(),
+        )
+        self.autorange_voltage_seg.grid(row=0, column=1, sticky="w")
+        ttk.Label(ranges, text="SMU1 [mV]").grid(row=0, column=2, padx=(16, 3), sticky="e")
+        self.voltage_range_smu1 = ttk.Entry(ranges, width=10)
+        self.voltage_range_smu1.grid(row=0, column=3, sticky="w")
+        ttk.Label(ranges, text="SMU2 [mV]").grid(row=0, column=4, padx=(10, 3), sticky="e")
+        self.voltage_range_smu2 = ttk.Entry(ranges, width=10)
+        self.voltage_range_smu2.grid(row=0, column=5, sticky="w")
+
+        ttk.Label(ranges, text="Autorange Current").grid(row=1, column=0, padx=4, pady=4, sticky="e")
+        self.autorange_current_seg = SegmentedControl(
+            ranges,
+            [("On", "1"), ("Manual", "0")],
+            "1",
+            lambda _: self.save_to_state(),
+        )
+        self.autorange_current_seg.grid(row=1, column=1, sticky="w")
+        ttk.Label(ranges, text="SMU1 [uA]").grid(row=1, column=2, padx=(16, 3), sticky="e")
+        self.current_range_smu1 = ttk.Entry(ranges, width=10)
+        self.current_range_smu1.grid(row=1, column=3, sticky="w")
+        ttk.Label(ranges, text="SMU2 [uA]").grid(row=1, column=4, padx=(10, 3), sticky="e")
+        self.current_range_smu2 = ttk.Entry(ranges, width=10)
+        self.current_range_smu2.grid(row=1, column=5, sticky="w")
 
         paths = ttk.LabelFrame(main, text="Paths and Actions")
         paths.pack(fill=tk.X, pady=6)
@@ -2162,8 +2706,17 @@ class GeneralSettingsWindow:
         )
         ttk.Button(paths, text="Save Now", command=self.app.coordinator.save_now).grid(row=1, column=1, sticky="w")
         ttk.Button(paths, text="Reset To Standard", command=self.reset_standard).grid(row=1, column=2, padx=4)
+        ttk.Button(paths, text="Info", command=self.app.open_info_window).grid(row=1, column=3, padx=4)
 
-        for ent in (self.current_limit, self.voltage_limit, self.nplc):
+        for ent in (
+            self.current_limit,
+            self.voltage_limit,
+            self.nplc,
+            self.voltage_range_smu1,
+            self.voltage_range_smu2,
+            self.current_range_smu1,
+            self.current_range_smu2,
+        ):
             ent.bind("<FocusOut>", lambda _e: self.save_to_state())
             ent.bind("<Return>", lambda _e: self.save_to_state())
 
@@ -2198,10 +2751,17 @@ class GeneralSettingsWindow:
         self.sequence_seg.set(cfg.sequence)
         self.header_seg.set("1" if cfg.put_header else "0")
         self.fast_cool_seg.set("1" if cfg.fast_cooldown else "0")
+        self.jitter_seg.set("1" if cfg.jitter else "0")
+        self.autorange_voltage_seg.set("1" if cfg.autorange_voltage else "0")
+        self.autorange_current_seg.set("1" if cfg.autorange_current else "0")
         self.autozero_seg.set(cfg.autozero)
         self._set_entry(self.current_limit, cfg.current_limit)
         self._set_entry(self.voltage_limit, cfg.voltage_limit)
         self._set_entry(self.nplc, cfg.nplc)
+        self._set_entry(self.voltage_range_smu1, cfg.voltage_range_smu1_mV)
+        self._set_entry(self.voltage_range_smu2, cfg.voltage_range_smu2_mV)
+        self._set_entry(self.current_range_smu1, cfg.current_range_smu1_uA)
+        self._set_entry(self.current_range_smu2, cfg.current_range_smu2_uA)
         self.save_path_label.configure(text=cfg.save_path)
         self.loading = False
 
@@ -2224,11 +2784,18 @@ class GeneralSettingsWindow:
         cfg.sequence = self.sequence_seg.get()
         cfg.put_header = self.header_seg.get() == "1"
         cfg.fast_cooldown = self.fast_cool_seg.get() == "1"
+        cfg.jitter = self.jitter_seg.get() == "1"
+        cfg.autorange_voltage = self.autorange_voltage_seg.get() == "1"
+        cfg.autorange_current = self.autorange_current_seg.get() == "1"
         cfg.autozero = self.autozero_seg.get()
         try:
             cfg.current_limit = parse_optional_float(self.current_limit.get())
             cfg.voltage_limit = parse_optional_float(self.voltage_limit.get())
             cfg.nplc = parse_optional_float(self.nplc.get())
+            cfg.voltage_range_smu1_mV = parse_optional_float(self.voltage_range_smu1.get())
+            cfg.voltage_range_smu2_mV = parse_optional_float(self.voltage_range_smu2.get())
+            cfg.current_range_smu1_uA = parse_optional_float(self.current_range_smu1.get())
+            cfg.current_range_smu2_uA = parse_optional_float(self.current_range_smu2.get())
         except ValueError:
             return
         self.app.state.save()
@@ -2257,10 +2824,10 @@ class MeasurementLauncherWindow:
     def __init__(self, app: "MeasurementApp"):
         self.app = app
         self.window = tk.Toplevel(app.root)
-        self.window.title(APP_TITLE + " - Measurements")
-        self.window.geometry("540x520+980+40")
+        self.window.title("Measurements")
         self.window.protocol("WM_DELETE_WINDOW", app.shutdown)
         self.build()
+        fit_window_to_content(self.window, min_w=300, min_h=260, max_w=460, max_h=620, x=980, y=40)
 
     def build(self) -> None:
         sections = [
@@ -2328,6 +2895,13 @@ class MeasurementApp:
                 "put_header": cfg.put_header,
                 "nplc": cfg.nplc,
                 "autozero": cfg.autozero,
+                "jitter": cfg.jitter,
+                "autorange_voltage": cfg.autorange_voltage,
+                "voltage_range_smu1_mV": cfg.voltage_range_smu1_mV,
+                "voltage_range_smu2_mV": cfg.voltage_range_smu2_mV,
+                "autorange_current": cfg.autorange_current,
+                "current_range_smu1_uA": cfg.current_range_smu1_uA,
+                "current_range_smu2_uA": cfg.current_range_smu2_uA,
                 "save_path": cfg.save_path,
                 "backup_path": cfg.backup_path,
                 "fast_cooldown": cfg.fast_cooldown,
@@ -2343,14 +2917,17 @@ class MeasurementApp:
                 "smu2": snapshot["smu"]["SMU2"],
             }
         )
+        warnings: List[str] = []
         for smu_name in active_smu_names(snapshot):
             dev = self.hardware.get_smu(smu_name)
             if not dev:
                 raise RuntimeError(f"{smu_name} is not connected")
             smu_cfg = cfg.smu1 if smu_name == "SMU1" else cfg.smu2
-            dev.configure(smu_cfg, cfg)
+            warnings.extend(dev.configure(smu_cfg, cfg))
             if cfg.autozero in ("Once", "Automatic"):
                 dev.set_autozero(cfg.autozero)
+        if warnings:
+            self.root.after(0, lambda text="\n".join(warnings): messagebox.showerror("Keithley configuration", text))
 
     def perform_autozero_now(self) -> None:
         cfg = self.state.general
@@ -2404,6 +2981,22 @@ class MeasurementApp:
         paths = run.save()
         msg = "Saved session snapshot." if paths else "No session data to save."
         messagebox.showinfo("Save Now", msg)
+
+    def open_info_window(self) -> None:
+        win = tk.Toplevel(self.root)
+        win.title("Info")
+        frame = ttk.Frame(win)
+        frame.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+        text = tk.Text(frame, wrap=tk.WORD, width=92, height=32)
+        scroll = ttk.Scrollbar(frame, orient=tk.VERTICAL, command=text.yview)
+        text.configure(yscrollcommand=scroll.set)
+        text.grid(row=0, column=0, sticky="nsew")
+        scroll.grid(row=0, column=1, sticky="ns")
+        frame.grid_rowconfigure(0, weight=1)
+        frame.grid_columnconfigure(0, weight=1)
+        text.insert(tk.END, INFO_TEXT)
+        text.configure(state=tk.DISABLED)
+        fit_window_to_content(win, min_w=620, min_h=420, max_w=820, max_h=680, x=160, y=120)
 
     def report_callback_exception(self, exc_type: type, exc: BaseException, tb: Any) -> None:
         EmergencyOutputGuard.output_off()
