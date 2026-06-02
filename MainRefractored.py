@@ -638,25 +638,64 @@ class Hardware:
             pass
         return 300.0
 
-    def close_sample_heat_switch(self) -> None:
-        # Different Kiutra API layers expose the heat-switch move differently.
+    def _is_heat_switch_closed(self, switch_name: str) -> Optional[bool]:
+        if self.client is None:
+            return None
+        query = getattr(self.client, "query", None)
+        if not callable(query):
+            return None
+        try:
+            value = query(f"{switch_name}.is_closed")
+        except Exception:
+            return None
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(value)
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in ("true", "1", "yes", "closed"):
+                return True
+            if normalized in ("false", "0", "no", "open"):
+                return False
+        return None
+
+    def _close_heat_switch(self, switch_name: str) -> bool:
+        # Kiutra's Heatswitch API exposes "closed" as the close command.
         calls: List[Callable[[], Any]] = []
-        if self.sample_control is not None:
+        if switch_name == "hs_sample" and self.sample_control is not None:
+            closed = getattr(self.sample_control, "closed", None)
+            if callable(closed):
+                calls.append(closed)
+            call_method = getattr(self.sample_control, "call_method", None)
+            if callable(call_method):
+                calls.append(lambda: call_method("closed"))
             mover = getattr(self.sample_control, "move", None)
             if callable(mover):
                 calls.append(lambda: mover("hs_sample", "closed"))
                 calls.append(lambda: mover("sample", "closed"))
         if self.client is not None:
+            caller = getattr(self.client, "call", None)
+            if callable(caller):
+                calls.append(lambda: caller(f"{switch_name}.closed"))
             for method_name in ("command", "execute", "write", "query"):
                 method = getattr(self.client, method_name, None)
                 if callable(method):
-                    calls.append(lambda m=method: m("move(hs_sample,'closed')"))
+                    calls.append(lambda m=method: m(f"move({switch_name},'closed')"))
         for call in calls:
             try:
                 call()
-                return
+                return True
             except Exception:
                 continue
+        return False
+
+    def close_sample_heat_switch(self) -> None:
+        for switch_name in ("hs_sample", "hs1", "hs2"):
+            is_closed = self._is_heat_switch_closed(switch_name)
+            if is_closed is True:
+                continue
+            self._close_heat_switch(switch_name)
 
 
 class SMUDevice:
@@ -804,6 +843,7 @@ class CryoController:
         fast_cooldown: bool,
         stop_event: threading.Event,
         status_cb: Callable[[str], None],
+        fast_cooldown_work: Optional[Callable[[float], bool]] = None,
     ) -> None:
         hw = self.hardware
         current = hw.read_temperature()
@@ -820,7 +860,11 @@ class CryoController:
                 status_cb(f"Fast cooldown: T={current:.3f} K -> waiting for < 5 K")
                 if current < 5.0:
                     break
-                time.sleep(0.5)
+                if fast_cooldown_work is None:
+                    time.sleep(0.5)
+                else:
+                    if not fast_cooldown_work(current):
+                        return
 
         if stop_event.is_set():
             return
@@ -1834,14 +1878,6 @@ class TcMeasurementWindow(MeasurementWindowBase):
         for target in parse_targets(s["targets"]):
             if run.stop_event.is_set():
                 break
-            self.app.cryo.start_target(
-                target["target"],
-                target["ramp"],
-                target["pre_regen"],
-                run.snapshot["general"]["fast_cooldown"],
-                run.stop_event,
-                self.set_status,
-            )
 
             def measure_once(temp: float) -> None:
                 for smu_name in active:
@@ -1853,6 +1889,23 @@ class TcMeasurementWindow(MeasurementWindowBase):
                     voltage, current = dev.measure(SOURCE_CURRENT, currents[smu_name])
                     run.add_point(smu_name, voltage, current, temp)
                 time.sleep(sample_s)
+
+            def measure_during_fast_cooldown(temp: float) -> bool:
+                if run.skip_temperature_event.is_set():
+                    return False
+                measure_once(temp)
+                self.set_status(f"Fast cooldown: T={temp:.3f} K -> {target['target']:.3f} K")
+                return not run.stop_event.is_set()
+
+            self.app.cryo.start_target(
+                target["target"],
+                target["ramp"],
+                target["pre_regen"],
+                run.snapshot["general"]["fast_cooldown"],
+                run.stop_event,
+                self.set_status,
+                measure_during_fast_cooldown,
+            )
 
             self.app.cryo.wait_for_target(
                 target["target"], 0.05, run.stop_event, run.skip_temperature_event, self.set_status, measure_once, 0.01
@@ -1905,9 +1958,17 @@ class IVTempContinuousWindow(MeasurementWindowBase):
         for target in parse_targets(s["targets"]):
             if run.stop_event.is_set():
                 break
+
+            def measure_during_fast_cooldown(temp: float) -> bool:
+                if run.skip_temperature_event.is_set():
+                    return False
+                execute_sweep_plans(self.app, run, plans, settle, repeat_shorter=True)
+                self.set_status(f"Fast cooldown: T={temp:.3f} K -> {target['target']:.3f} K")
+                return not run.stop_event.is_set()
+
             self.app.cryo.start_target(
                 target["target"], target["ramp"], target["pre_regen"], run.snapshot["general"]["fast_cooldown"],
-                run.stop_event, self.set_status
+                run.stop_event, self.set_status, measure_during_fast_cooldown
             )
             while not run.stop_event.is_set():
                 temp = self.app.hardware.read_temperature()
@@ -2089,9 +2150,24 @@ class TempJJContinuousWindow(FindJJWindow):
         for target in parse_targets(run.measurement_settings["targets"]):
             if run.stop_event.is_set():
                 break
+
+            def measure_during_fast_cooldown(temp: float) -> bool:
+                if run.skip_temperature_event.is_set():
+                    return False
+                for smu_name in active_smu_names(run.snapshot):
+                    dev = self.app.hardware.get_smu(smu_name)
+                    if not dev:
+                        continue
+                    crossed, new_markers = find_jj_fine(run, dev, smu_name, params, previous.get(smu_name, {}), fine_window)
+                    if not crossed:
+                        new_markers = find_jj_full(run, dev, smu_name, params)
+                    previous[smu_name] = new_markers
+                self.set_status(f"Fast cooldown: T={temp:.3f} K -> {target['target']:.3f} K")
+                return not run.stop_event.is_set()
+
             self.app.cryo.start_target(
                 target["target"], target["ramp"], target["pre_regen"], run.snapshot["general"]["fast_cooldown"],
-                run.stop_event, self.set_status
+                run.stop_event, self.set_status, measure_during_fast_cooldown
             )
             while not run.stop_event.is_set():
                 temp = self.app.hardware.read_temperature()
