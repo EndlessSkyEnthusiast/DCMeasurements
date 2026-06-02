@@ -288,6 +288,7 @@ def choose_axis_scale(field: str, values: Sequence[float]) -> Tuple[float, str]:
 
 
 def raw_values(rows: Sequence[Dict[str, Any]], field: str) -> List[float]:
+    # Resistance axes are derived at plot time so saved raw data remains unchanged.
     if field == "Resistance":
         out = []
         for row in rows:
@@ -299,6 +300,7 @@ def raw_values(rows: Sequence[Dict[str, Any]], field: str) -> List[float]:
                 out.append(float(voltage) / float(current))
         return out
     if field == "Delta R":
+        # Compute dV/dI from neighboring points per SMU; mixed SMU rows must not be paired.
         out: List[float] = []
         previous_by_smu: Dict[Any, Tuple[float, float]] = {}
         for row in rows:
@@ -409,6 +411,7 @@ def ensure_dir(path: str) -> bool:
 
 
 def temp_range_tag(rows: Sequence[Dict[str, Any]]) -> str:
+    # Compact temperature tag for filenames; use a range when one sweep spans multiple readings.
     temps = [float(r["temperature"]) for r in rows if is_number(r.get("temperature"))]
     if not temps:
         return ""
@@ -895,6 +898,7 @@ class CryoController:
                     hw.temperature_control.stop()
             except Exception:
                 pass
+            # Closing all heat switches improves passive cooling before normal control resumes below 5 K.
             hw.close_sample_heat_switch()
             while not stop_event.is_set():
                 current = hw.read_temperature()
@@ -1024,8 +1028,12 @@ class TextSaver:
         if not rows:
             return []
         folders = run.iv_round_folders(smu_name)
-        tag = sanitize_filename(label, "") if label else ""
-        filename = f"round_{round_index:04d}_{tag}.txt" if tag else f"round_{round_index:04d}.txt"
+        base = sanitize_filename(run.snapshot["smu"].get(smu_name, {}).get("filename"), smu_name)
+        temp_tag = temp_range_tag(rows)
+        parts = [base, f"{round_index:04d}", now_stamp()]
+        if temp_tag:
+            parts.append(temp_tag)
+        filename = sanitize_filename("_".join(parts), f"{smu_name}_{round_index:04d}") + ".txt"
         text = self._standard_text(run, smu_name, rows)
         paths: List[str] = []
         for folder in folders:
@@ -1201,6 +1209,7 @@ class MeasurementRun:
         self.iv_round_enabled = True
 
     def iv_round_folders(self, smu_name: str) -> List[str]:
+        # Each IV-like run gets one primary and one backup folder per SMU for round-by-round safety saves.
         cached = self.iv_round_dirs.get(smu_name)
         if cached:
             return cached
@@ -1217,6 +1226,7 @@ class MeasurementRun:
     def save_iv_round(self, label: str = "") -> None:
         if not self.iv_round_enabled:
             return
+        # Only write rows that were produced since the previous round save to avoid duplicate data files.
         self.iv_round_index += 1
         rows = self.rows_snapshot()
         for smu_name in ("SMU1", "SMU2"):
@@ -1238,6 +1248,7 @@ class MeasurementRun:
         self.temperature_guard_active = bool(general.get("temperature_guard_enabled"))
 
     def check_temperature_guard(self, temperature: Optional[float] = None) -> bool:
+        # DC measurements guard the actual current cryostat temperature.
         if not self.temperature_guard_active or self.temperature_guard_triggered:
             return not self.temperature_guard_triggered
         general = self.snapshot.get("general", {})
@@ -1266,6 +1277,7 @@ class MeasurementRun:
         return False
 
     def check_temperature_guard_setpoint(self, target: float) -> bool:
+        # Temperature-point measurements guard the requested setpoint, not the transient actual temperature.
         general = self.snapshot.get("general", {})
         if not general.get("temperature_guard_enabled"):
             return True
@@ -1307,6 +1319,7 @@ class MeasurementRun:
         return " / ".join(bounds)
 
     def _wait_for_temperature_guard_range(self, temp: float, lo: Optional[float], hi: Optional[float]) -> bool:
+        # Wait-and-continue turns outputs off, waits inside the range, then retries the same measurement point.
         self.temperature_guard_pause_count += 1
         self.app.hardware.output_off_all()
         bounds_text = self._temperature_guard_bounds_text(lo, hi)
@@ -2727,6 +2740,7 @@ def execute_sweep_plans(
             if not run.check_temperature_guard(temp):
                 return
             if run.temperature_guard_pause_count != pause_count:
+                # The guard may have switched outputs off while waiting; repeat this point from apply_source.
                 continue
             for smu_name, dev, mode, level in to_measure:
                 voltage, current = dev.measure(mode, level)
@@ -2755,6 +2769,7 @@ def execute_one_smu_plan(app: "MeasurementApp", run: MeasurementRun, smu_name: s
         if not run.check_temperature_guard(temp):
             return
         if run.temperature_guard_pause_count != pause_count:
+            # The guard may have switched outputs off while waiting; repeat this point from apply_source.
             continue
         voltage, current = dev.measure(mode, level)
         run.add_point(smu_name, voltage, current, temp, extra={"source_level": level})
@@ -2947,6 +2962,7 @@ def jj_apply_measure(
             return guard_row
         if run.temperature_guard_pause_count == pause_count:
             break
+        # The guard may have switched outputs off while waiting; repeat this JJ point from apply_source.
     else:
         return guard_row
     voltage, current = dev.measure(SOURCE_CURRENT, current_A)
