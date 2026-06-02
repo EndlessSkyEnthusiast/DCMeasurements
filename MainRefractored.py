@@ -205,7 +205,8 @@ SOURCE_VOLTAGE = "voltage"
 SEQUENCE_PARALLEL = "parallel"
 SEQUENCE_SEQUENTIAL = "sequential"
 
-PLOT_FIELDS = ["Time", "Voltage", "Current", "Temperature", "Magnetic Field"]
+MIN_RESISTANCE_CURRENT_A = 1e-11
+PLOT_FIELDS = ["Time", "Voltage", "Current", "Resistance", "Differential Resistance", "Temperature", "Magnetic Field"]
 PLOT_FIELD_KEYS = {
     "Time": "elapsed_s",
     "Voltage": "voltage",
@@ -264,6 +265,8 @@ def choose_axis_scale(field: str, values: Sequence[float]) -> Tuple[float, str]:
         units = [(1.0, "A"), (1e-3, "mA"), (1e-6, "uA"), (1e-9, "nA"), (1e-12, "pA")]
     elif field == "Voltage":
         units = [(1.0, "V"), (1e-3, "mV"), (1e-6, "uV"), (1e-9, "nV")]
+    elif field in ("Resistance", "Differential Resistance"):
+        units = [(1e9, "GOhm"), (1e6, "MOhm"), (1e3, "kOhm"), (1.0, "Ohm"), (1e-3, "mOhm")]
     elif field == "Time":
         if max_abs >= 3600:
             return 3600.0, "h"
@@ -283,6 +286,34 @@ def choose_axis_scale(field: str, values: Sequence[float]) -> Tuple[float, str]:
 
 
 def raw_values(rows: Sequence[Dict[str, Any]], field: str) -> List[float]:
+    if field == "Resistance":
+        out = []
+        for row in rows:
+            voltage = row.get("voltage", float("nan"))
+            current = row.get("current", float("nan"))
+            if not is_number(voltage) or not is_number(current) or abs(float(current)) < MIN_RESISTANCE_CURRENT_A:
+                out.append(float("nan"))
+            else:
+                out.append(float(voltage) / float(current))
+        return out
+    if field == "Differential Resistance":
+        out: List[float] = []
+        previous_by_smu: Dict[Any, Tuple[float, float]] = {}
+        for row in rows:
+            smu_name = row.get("smu", "_")
+            voltage = row.get("voltage", float("nan"))
+            current = row.get("current", float("nan"))
+            value = float("nan")
+            if is_number(voltage) and is_number(current) and abs(float(current)) >= MIN_RESISTANCE_CURRENT_A:
+                previous = previous_by_smu.get(smu_name)
+                if previous is not None:
+                    prev_voltage, prev_current = previous
+                    delta_current = float(current) - prev_current
+                    if abs(delta_current) >= MIN_RESISTANCE_CURRENT_A:
+                        value = (float(voltage) - prev_voltage) / delta_current
+                previous_by_smu[smu_name] = (float(voltage), float(current))
+            out.append(value)
+        return out
     key = PLOT_FIELD_KEYS[field]
     out = []
     for row in rows:
@@ -848,7 +879,7 @@ class CryoController:
         hw = self.hardware
         current = hw.read_temperature()
         if fast_cooldown and current > 7.0 and target < 5.0:
-            status_cb(f"Fast cooldown: T={current:.3f} K, stopping TemperatureControl until below 5 K")
+            status_cb(f"Fast cooldown: waiting for < 5 K")
             try:
                 if hw.temperature_control is not None:
                     hw.temperature_control.stop()
@@ -857,7 +888,6 @@ class CryoController:
             hw.close_sample_heat_switch()
             while not stop_event.is_set():
                 current = hw.read_temperature()
-                status_cb(f"Fast cooldown: T={current:.3f} K -> waiting for < 5 K")
                 if current < 5.0:
                     break
                 if fast_cooldown_work is None:
@@ -1177,7 +1207,7 @@ class LiveMeasurementPlot:
             ("Scale", self.scale_var, ["auto", "manual"]),
         ):
             ttk.Label(row1, text=label).pack(side=tk.LEFT, padx=(8, 2))
-            ttk.Combobox(row1, textvariable=var, values=values, width=13, state="readonly").pack(side=tk.LEFT)
+            ttk.Combobox(row1, textvariable=var, values=values, width=23, state="readonly").pack(side=tk.LEFT)
         self.axis_entries: Dict[str, ttk.Entry] = {}
         for label in ("xmin", "xmax", "ymin", "ymax"):
             ttk.Label(row2, text=label).pack(side=tk.LEFT, padx=(8, 2))
@@ -1194,7 +1224,7 @@ class LiveMeasurementPlot:
         self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True, padx=8, pady=6)
         for var in (self.x_var, self.y_var, self.color_var, self.style_var, self.scale_var):
             var.trace_add("write", lambda *_: self.redraw())
-        fit_window_to_content(self.window, min_w=680, min_h=470, max_w=820, max_h=620, x=360, y=140)
+        fit_window_to_content(self.window, min_w=980, min_h=470, max_w=1180, max_h=620, x=360, y=140)
         self.redraw()
 
     def redraw(self) -> None:
@@ -1315,7 +1345,7 @@ class SessionPlotWindow:
             ("Style", self.style_var, ["scatter", "line", "line+scatter"]),
         ):
             ttk.Label(ctl, text=label).pack(side=tk.LEFT, padx=(8, 2))
-            ttk.Combobox(ctl, textvariable=var, values=values, width=13, state="readonly").pack(side=tk.LEFT)
+            ttk.Combobox(ctl, textvariable=var, values=values, width=23, state="readonly").pack(side=tk.LEFT)
         ttk.Button(ctl, text="Reset", command=self.reset).pack(side=tk.RIGHT)
         self.fig = Figure(figsize=(6.0, 3.6), dpi=100)
         self.ax = self.fig.add_subplot(111)
@@ -1324,7 +1354,7 @@ class SessionPlotWindow:
         self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True, padx=8, pady=6)
         for var in (self.x_var, self.y_var, self.color_var, self.style_var):
             var.trace_add("write", lambda *_: self.redraw())
-        fit_window_to_content(self.window, min_w=620, min_h=420, max_w=760, max_h=560)
+        fit_window_to_content(self.window, min_w=900, min_h=420, max_w=1080, max_h=560)
         self.redraw()
 
     def on_close(self) -> None:
@@ -1894,7 +1924,6 @@ class TcMeasurementWindow(MeasurementWindowBase):
                 if run.skip_temperature_event.is_set():
                     return False
                 measure_once(temp)
-                self.set_status(f"Fast cooldown: T={temp:.3f} K -> {target['target']:.3f} K")
                 return not run.stop_event.is_set()
 
             self.app.cryo.start_target(
@@ -1963,7 +1992,6 @@ class IVTempContinuousWindow(MeasurementWindowBase):
                 if run.skip_temperature_event.is_set():
                     return False
                 execute_sweep_plans(self.app, run, plans, settle, repeat_shorter=True)
-                self.set_status(f"Fast cooldown: T={temp:.3f} K -> {target['target']:.3f} K")
                 return not run.stop_event.is_set()
 
             self.app.cryo.start_target(
@@ -2162,7 +2190,6 @@ class TempJJContinuousWindow(FindJJWindow):
                     if not crossed:
                         new_markers = find_jj_full(run, dev, smu_name, params)
                     previous[smu_name] = new_markers
-                self.set_status(f"Fast cooldown: T={temp:.3f} K -> {target['target']:.3f} K")
                 return not run.stop_event.is_set()
 
             self.app.cryo.start_target(
