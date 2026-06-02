@@ -204,9 +204,11 @@ SOURCE_CURRENT = "current"
 SOURCE_VOLTAGE = "voltage"
 SEQUENCE_PARALLEL = "parallel"
 SEQUENCE_SEQUENTIAL = "sequential"
+TEMP_GUARD_SAVE_STOP = "save_stop"
+TEMP_GUARD_WAIT_CONTINUE = "wait_continue"
 
 MIN_RESISTANCE_CURRENT_A = 1e-11
-PLOT_FIELDS = ["Time", "Voltage", "Current", "Resistance", "Differential Resistance", "Temperature", "Magnetic Field"]
+PLOT_FIELDS = ["Time", "Voltage", "Current", "Resistance", "Delta R", "Temperature", "Magnetic Field"]
 PLOT_FIELD_KEYS = {
     "Time": "elapsed_s",
     "Voltage": "voltage",
@@ -265,7 +267,7 @@ def choose_axis_scale(field: str, values: Sequence[float]) -> Tuple[float, str]:
         units = [(1.0, "A"), (1e-3, "mA"), (1e-6, "uA"), (1e-9, "nA"), (1e-12, "pA")]
     elif field == "Voltage":
         units = [(1.0, "V"), (1e-3, "mV"), (1e-6, "uV"), (1e-9, "nV")]
-    elif field in ("Resistance", "Differential Resistance"):
+    elif field in ("Resistance", "Delta R"):
         units = [(1e9, "GOhm"), (1e6, "MOhm"), (1e3, "kOhm"), (1.0, "Ohm"), (1e-3, "mOhm")]
     elif field == "Time":
         if max_abs >= 3600:
@@ -296,7 +298,7 @@ def raw_values(rows: Sequence[Dict[str, Any]], field: str) -> List[float]:
             else:
                 out.append(float(voltage) / float(current))
         return out
-    if field == "Differential Resistance":
+    if field == "Delta R":
         out: List[float] = []
         previous_by_smu: Dict[Any, Tuple[float, float]] = {}
         for row in rows:
@@ -495,6 +497,10 @@ class GeneralConfig:
     save_path: str = DEFAULT_SAVE_PATH
     backup_path: str = DEFAULT_BACKUP_PATH
     fast_cooldown: bool = True
+    temperature_guard_enabled: bool = False
+    temperature_guard_mode: str = TEMP_GUARD_SAVE_STOP
+    temperature_guard_min_K: Optional[float] = None
+    temperature_guard_max_K: Optional[float] = None
 
     @staticmethod
     def from_dict(data: Dict[str, Any]) -> "GeneralConfig":
@@ -512,6 +518,8 @@ class GeneralConfig:
             "save_path",
             "backup_path",
             "fast_cooldown",
+            "temperature_guard_enabled",
+            "temperature_guard_mode",
         ):
             if key in data:
                 setattr(cfg, key, data[key])
@@ -522,6 +530,8 @@ class GeneralConfig:
             "voltage_range_smu2_mV",
             "current_range_smu1_uA",
             "current_range_smu2_uA",
+            "temperature_guard_min_K",
+            "temperature_guard_max_K",
         ):
             value = data.get(key)
             setattr(cfg, key, None if value in ("", None) else float(value))
@@ -943,6 +953,8 @@ class CryoController:
             temp = self.hardware.read_temperature()
             if while_waiting:
                 while_waiting(temp)
+            if stop_event.is_set():
+                return "stopped"
             if skip_event.is_set():
                 skip_event.clear()
                 status_cb(f"Skipped target {target:.3f} K")
@@ -1001,6 +1013,25 @@ class TextSaver:
             )
         return self._write_to_primary_and_backup(filename, "\n".join(header_lines + body) + "\n")
 
+    def write_iv_round(
+        self,
+        run: "MeasurementRun",
+        smu_name: str,
+        rows: Sequence[Dict[str, Any]],
+        round_index: int,
+        label: str = "",
+    ) -> List[str]:
+        if not rows:
+            return []
+        folders = run.iv_round_folders(smu_name)
+        tag = sanitize_filename(label, "") if label else ""
+        filename = f"round_{round_index:04d}_{tag}.txt" if tag else f"round_{round_index:04d}.txt"
+        text = self._standard_text(run, smu_name, rows)
+        paths: List[str] = []
+        for folder in folders:
+            paths.extend(self._write_to_folder(folder, filename, text))
+        return paths
+
     def _standard_text(self, run: "MeasurementRun", smu_name: str, rows: Sequence[Dict[str, Any]]) -> str:
         header = []
         if run.snapshot["general"]["put_header"]:
@@ -1058,6 +1089,17 @@ class TextSaver:
                 continue
         return out
 
+    def _write_to_folder(self, folder: str, filename: str, text: str) -> List[str]:
+        if not ensure_dir(folder):
+            return []
+        full = os.path.join(folder, filename)
+        try:
+            with open(full, "w", encoding="utf-8") as fh:
+                fh.write(text)
+            return [full]
+        except Exception:
+            return []
+
 
 class MeasurementRun:
     def __init__(
@@ -1084,6 +1126,15 @@ class MeasurementRun:
         self.saved = False
         self.save_now_requested = False
         self.error: Optional[str] = None
+        self.temperature_guard_active = False
+        self.temperature_guard_triggered = False
+        self.temperature_guard_message = ""
+        self.temperature_guard_pause_count = 0
+        self.iv_round_enabled = False
+        self.iv_round_stamp = now_stamp()
+        self.iv_round_dirs: Dict[str, List[str]] = {}
+        self.iv_round_saved_counts: Dict[str, int] = {"SMU1": 0, "SMU2": 0}
+        self.iv_round_index = 0
         self.estimated_total_points: Optional[int] = None
         self.estimated_total_seconds: Optional[float] = None
         self.live_plot = LiveMeasurementPlot(app, self) if create_live_plot else None
@@ -1146,11 +1197,131 @@ class MeasurementRun:
         with self.lock:
             return list(self.fraunhofer_rows)
 
+    def enable_iv_round_saves(self) -> None:
+        self.iv_round_enabled = True
+
+    def iv_round_folders(self, smu_name: str) -> List[str]:
+        cached = self.iv_round_dirs.get(smu_name)
+        if cached:
+            return cached
+        base_name = self.snapshot["smu"].get(smu_name, {}).get("filename", smu_name)
+        folder_name = f"{sanitize_filename(base_name, smu_name)}_{self.iv_round_stamp}"
+        general = self.snapshot["general"]
+        folders = []
+        for root in (general.get("save_path") or DEFAULT_SAVE_PATH, general.get("backup_path") or DEFAULT_BACKUP_PATH):
+            if root:
+                folders.append(os.path.join(root, folder_name))
+        self.iv_round_dirs[smu_name] = folders
+        return folders
+
+    def save_iv_round(self, label: str = "") -> None:
+        if not self.iv_round_enabled:
+            return
+        self.iv_round_index += 1
+        rows = self.rows_snapshot()
+        for smu_name in ("SMU1", "SMU2"):
+            smu_rows = [r for r in rows if r.get("smu") == smu_name]
+            start = self.iv_round_saved_counts.get(smu_name, 0)
+            new_rows = smu_rows[start:]
+            if new_rows:
+                self.app.saver.write_iv_round(self, smu_name, new_rows, self.iv_round_index, label)
+                self.iv_round_saved_counts[smu_name] = len(smu_rows)
+
     def request_save_now(self) -> None:
         self.save_now_requested = True
         self.stop_event.set()
         self.skip_temperature_event.set()
         self.app.hardware.output_off_all()
+
+    def enable_temperature_guard(self) -> None:
+        general = self.snapshot.get("general", {})
+        self.temperature_guard_active = bool(general.get("temperature_guard_enabled"))
+
+    def check_temperature_guard(self, temperature: Optional[float] = None) -> bool:
+        if not self.temperature_guard_active or self.temperature_guard_triggered:
+            return not self.temperature_guard_triggered
+        general = self.snapshot.get("general", {})
+        lo = general.get("temperature_guard_min_K")
+        hi = general.get("temperature_guard_max_K")
+        if lo is None and hi is None:
+            return True
+        bounds = self._temperature_guard_bounds(lo, hi)
+        if bounds is None:
+            return True
+        lo_f, hi_f = bounds
+        try:
+            temp = self.app.hardware.read_temperature() if temperature is None else float(temperature)
+        except Exception:
+            return True
+        if self._temperature_in_guard_range(temp, lo_f, hi_f):
+            return True
+        mode = general.get("temperature_guard_mode", TEMP_GUARD_SAVE_STOP)
+        if mode == TEMP_GUARD_WAIT_CONTINUE:
+            return self._wait_for_temperature_guard_range(temp, lo_f, hi_f)
+        self.temperature_guard_triggered = True
+        self.temperature_guard_message = (
+            f"Temperature guard: T={temp:.3f} K outside {self._temperature_guard_bounds_text(lo_f, hi_f)}"
+        )
+        self.request_save_now()
+        return False
+
+    def check_temperature_guard_setpoint(self, target: float) -> bool:
+        general = self.snapshot.get("general", {})
+        if not general.get("temperature_guard_enabled"):
+            return True
+        bounds = self._temperature_guard_bounds(
+            general.get("temperature_guard_min_K"), general.get("temperature_guard_max_K")
+        )
+        if bounds is None:
+            return True
+        lo_f, hi_f = bounds
+        target_f = float(target)
+        if self._temperature_in_guard_range(target_f, lo_f, hi_f):
+            return True
+        self.temperature_guard_triggered = True
+        self.temperature_guard_message = (
+            f"Temperature guard: target {target_f:.3f} K outside {self._temperature_guard_bounds_text(lo_f, hi_f)}"
+        )
+        self.request_save_now()
+        return False
+
+    def _temperature_guard_bounds(self, lo: Any, hi: Any) -> Optional[Tuple[Optional[float], Optional[float]]]:
+        try:
+            lo_f = float(lo) if lo is not None else None
+            hi_f = float(hi) if hi is not None else None
+        except Exception:
+            return None
+        if lo_f is not None and hi_f is not None and lo_f > hi_f:
+            lo_f, hi_f = hi_f, lo_f
+        return lo_f, hi_f
+
+    def _temperature_in_guard_range(self, temp: float, lo: Optional[float], hi: Optional[float]) -> bool:
+        return not ((lo is not None and temp < lo) or (hi is not None and temp > hi))
+
+    def _temperature_guard_bounds_text(self, lo: Optional[float], hi: Optional[float]) -> str:
+        bounds = []
+        if lo is not None:
+            bounds.append(f"min {lo:.3f} K")
+        if hi is not None:
+            bounds.append(f"max {hi:.3f} K")
+        return " / ".join(bounds)
+
+    def _wait_for_temperature_guard_range(self, temp: float, lo: Optional[float], hi: Optional[float]) -> bool:
+        self.temperature_guard_pause_count += 1
+        self.app.hardware.output_off_all()
+        bounds_text = self._temperature_guard_bounds_text(lo, hi)
+        self.temperature_guard_message = f"Temperature guard: T={temp:.3f} K outside {bounds_text}; waiting"
+        while not self.stop_event.is_set():
+            time.sleep(0.5)
+            try:
+                temp = self.app.hardware.read_temperature()
+            except Exception:
+                continue
+            if self._temperature_in_guard_range(temp, lo, hi):
+                self.temperature_guard_message = f"Temperature guard: T={temp:.3f} K inside range; continuing"
+                return True
+            self.temperature_guard_message = f"Temperature guard: T={temp:.3f} K outside {bounds_text}; waiting"
+        return False
 
     def set_estimate(self, total_points: Optional[int], total_seconds: Optional[float]) -> None:
         self.estimated_total_points = total_points
@@ -1207,7 +1378,7 @@ class LiveMeasurementPlot:
             ("Scale", self.scale_var, ["auto", "manual"]),
         ):
             ttk.Label(row1, text=label).pack(side=tk.LEFT, padx=(8, 2))
-            ttk.Combobox(row1, textvariable=var, values=values, width=23, state="readonly").pack(side=tk.LEFT)
+            ttk.Combobox(row1, textvariable=var, values=values, width=13, state="readonly").pack(side=tk.LEFT)
         self.axis_entries: Dict[str, ttk.Entry] = {}
         for label in ("xmin", "xmax", "ymin", "ymax"):
             ttk.Label(row2, text=label).pack(side=tk.LEFT, padx=(8, 2))
@@ -1224,7 +1395,7 @@ class LiveMeasurementPlot:
         self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True, padx=8, pady=6)
         for var in (self.x_var, self.y_var, self.color_var, self.style_var, self.scale_var):
             var.trace_add("write", lambda *_: self.redraw())
-        fit_window_to_content(self.window, min_w=980, min_h=470, max_w=1180, max_h=620, x=360, y=140)
+        fit_window_to_content(self.window, min_w=680, min_h=470, max_w=820, max_h=620, x=360, y=140)
         self.redraw()
 
     def redraw(self) -> None:
@@ -1345,7 +1516,7 @@ class SessionPlotWindow:
             ("Style", self.style_var, ["scatter", "line", "line+scatter"]),
         ):
             ttk.Label(ctl, text=label).pack(side=tk.LEFT, padx=(8, 2))
-            ttk.Combobox(ctl, textvariable=var, values=values, width=23, state="readonly").pack(side=tk.LEFT)
+            ttk.Combobox(ctl, textvariable=var, values=values, width=13, state="readonly").pack(side=tk.LEFT)
         ttk.Button(ctl, text="Reset", command=self.reset).pack(side=tk.RIGHT)
         self.fig = Figure(figsize=(6.0, 3.6), dpi=100)
         self.ax = self.fig.add_subplot(111)
@@ -1354,7 +1525,7 @@ class SessionPlotWindow:
         self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True, padx=8, pady=6)
         for var in (self.x_var, self.y_var, self.color_var, self.style_var):
             var.trace_add("write", lambda *_: self.redraw())
-        fit_window_to_content(self.window, min_w=900, min_h=420, max_w=1080, max_h=560)
+        fit_window_to_content(self.window, min_w=620, min_h=420, max_w=760, max_h=560)
         self.redraw()
 
     def on_close(self) -> None:
@@ -1417,6 +1588,7 @@ class TemperaturePlotWindow:
         self.fig: Optional[Figure] = None
         self.ax: Any = None
         self.canvas: Any = None
+        self.current_temp_var = tk.StringVar(value="T avg 5 s: -- K")
         self.open()
 
     def open(self) -> None:
@@ -1426,6 +1598,9 @@ class TemperaturePlotWindow:
         self.window.protocol("WM_DELETE_WINDOW", self.on_close)
         ctl = ttk.Frame(self.window)
         ctl.pack(fill=tk.X, padx=8, pady=5)
+        ttk.Label(ctl, textvariable=self.current_temp_var, font=("TkDefaultFont", 13, "bold")).pack(
+            side=tk.LEFT, padx=(4, 16)
+        )
         ttk.Button(ctl, text="Reset", command=self.reset).pack(side=tk.RIGHT)
         self.fig = Figure(figsize=(6.0, 3.4), dpi=100)
         self.ax = self.fig.add_subplot(111)
@@ -1458,7 +1633,21 @@ class TemperaturePlotWindow:
             ys = [p[1] for p in self.app.temperature_history]
             self.ax.plot(xs, ys, marker="o", markersize=2, linewidth=0.8)
             apply_auto_limits(self.ax, xs, ys)
+        self._update_current_temperature_label()
         self.canvas.draw_idle()
+
+    def _update_current_temperature_label(self) -> None:
+        history = self.app.temperature_history
+        if not history:
+            self.current_temp_var.set("T avg 5 s: -- K")
+            return
+        latest_t = history[-1][0]
+        values = [temp for elapsed, temp in history if latest_t - elapsed <= 5.0 and is_number(temp)]
+        if not values:
+            self.current_temp_var.set("T avg 5 s: -- K")
+            return
+        avg = sum(float(v) for v in values) / len(values)
+        self.current_temp_var.set(f"T avg 5 s: {avg:.3f} K")
 
 
 class MeasurementCoordinator:
@@ -1524,6 +1713,8 @@ class MeasurementCoordinator:
             run.live_plot.redraw()
         if run.error:
             messagebox.showerror(run.name, run.error)
+        elif run.temperature_guard_triggered and run.temperature_guard_message:
+            messagebox.showinfo(run.name, run.temperature_guard_message)
         else:
             messagebox.showinfo(run.name, "Measurement Finished")
 
@@ -1601,6 +1792,9 @@ class MeasurementWindowBase:
     def _refresh_loop(self) -> None:
         self.update_local_estimate()
         self.app.coordinator.refresh_buttons()
+        run = self.app.coordinator.active_run
+        if run and run.name == self.title and run.temperature_guard_triggered and run.temperature_guard_message:
+            self.status_var.set(run.temperature_guard_message)
         if self.window.winfo_exists():
             self.window.after(1000, self._refresh_loop)
 
@@ -1700,6 +1894,7 @@ class SimpleDCWindow(MeasurementWindowBase):
         }
 
     def worker(self, run: MeasurementRun) -> None:
+        run.enable_temperature_guard()
         settings = run.measurement_settings
         settle = max(0.0, float(settings["settle_ms"]) * 1e-3)
         plans = build_segment_plans(run.snapshot, settings)
@@ -1737,9 +1932,12 @@ class CyclicDCWindow(MeasurementWindowBase):
         return {key: ent.get() for key, ent in self.entries.items()}
 
     def worker(self, run: MeasurementRun) -> None:
+        run.enable_temperature_guard()
         s = run.measurement_settings
         steps = int(float(s["steps"]))
         cycles = parse_optional_int(s["cycles"]) or 0
+        if cycles <= 0 or cycles > 1:
+            run.enable_iv_round_saves()
         settle = max(0.0, float(s["settle_ms"]) * 1e-3)
         one_cycle_plans: Dict[str, List[float]] = {}
         for smu_name, key in (("SMU1", "max_smu1"), ("SMU2", "max_smu2")):
@@ -1766,6 +1964,7 @@ class CyclicDCWindow(MeasurementWindowBase):
                         levels = jitter_nominal_levels(levels)
                     execute_one_smu_plan(self.app, run, smu_name, levels, settle)
                 completed += 1
+                run.save_iv_round(f"cycle_{completed:04d}")
             return
         if cycles <= 0:
             completed = 0
@@ -1775,6 +1974,7 @@ class CyclicDCWindow(MeasurementWindowBase):
                     plans = {name: jitter_nominal_levels(levels) for name, levels in one_cycle_plans.items()}
                 execute_sweep_plans(self.app, run, plans, settle, repeat_shorter=True)
                 completed += 1
+                run.save_iv_round(f"cycle_{completed:04d}")
         else:
             for cycle_idx in range(cycles):
                 if run.stop_event.is_set():
@@ -1783,6 +1983,7 @@ class CyclicDCWindow(MeasurementWindowBase):
                 if jitter_on and cycle_idx > 0:
                     plans = {name: jitter_nominal_levels(levels) for name, levels in one_cycle_plans.items()}
                 execute_sweep_plans(self.app, run, plans, settle)
+                run.save_iv_round(f"cycle_{cycle_idx + 1:04d}")
 
 
 class TemperatureTargetEditor(ttk.LabelFrame):
@@ -1981,6 +2182,7 @@ class IVTempContinuousWindow(MeasurementWindowBase):
         }
 
     def worker(self, run: MeasurementRun) -> None:
+        run.enable_iv_round_saves()
         s = run.measurement_settings
         settle = max(0.0, float(s["settle_ms"]) * 1e-3)
         plans = build_segment_plans(run.snapshot, s)
@@ -1992,6 +2194,7 @@ class IVTempContinuousWindow(MeasurementWindowBase):
                 if run.skip_temperature_event.is_set():
                     return False
                 execute_sweep_plans(self.app, run, plans, settle, repeat_shorter=True)
+                run.save_iv_round(f"fastcool_T{temp:.3f}K")
                 return not run.stop_event.is_set()
 
             self.app.cryo.start_target(
@@ -2006,6 +2209,7 @@ class IVTempContinuousWindow(MeasurementWindowBase):
                 if abs(temp - target["target"]) <= 0.05:
                     break
                 execute_sweep_plans(self.app, run, plans, settle, repeat_shorter=True)
+                run.save_iv_round(f"T{temp:.3f}K_to_{target['target']:.3f}K")
                 self.set_status(f"T={temp:.3f} K -> {target['target']:.3f} K")
 
 
@@ -2036,24 +2240,34 @@ class IVTempAtTemperaturesWindow(IVTempContinuousWindow):
         ttk.Button(self.body, text="Skip Current Temperature", command=self.skip_temperature).grid(row=4, column=0, sticky="w")
 
     def worker(self, run: MeasurementRun) -> None:
+        run.enable_iv_round_saves()
         s = run.measurement_settings
         settle = max(0.0, float(s["settle_ms"]) * 1e-3)
         plans = build_segment_plans(run.snapshot, s)
         for target in parse_targets(s["targets"]):
             if run.stop_event.is_set():
                 break
+            if not run.check_temperature_guard_setpoint(target["target"]):
+                break
             self.app.cryo.start_target(
                 target["target"], target["ramp"], target["pre_regen"], run.snapshot["general"]["fast_cooldown"],
                 run.stop_event, self.set_status
             )
             self.app.cryo.wait_for_target(
-                target["target"], 0.05, run.stop_event, run.skip_temperature_event, self.set_status, None, 0.25
+                target["target"],
+                0.05,
+                run.stop_event,
+                run.skip_temperature_event,
+                self.set_status,
+                None,
+                0.25,
             )
             stable_until = time.time() + max(0.0, target.get("stable_s", 0.0))
             while time.time() < stable_until and not run.stop_event.is_set():
                 self.set_status(f"Stabilizing at {target['target']:.3f} K")
                 time.sleep(0.25)
             execute_sweep_plans(self.app, run, plans, settle)
+            run.save_iv_round(f"T{target['target']:.3f}K")
 
 
 class FindJJWindow(MeasurementWindowBase):
@@ -2222,12 +2436,20 @@ class TempJJAtTemperaturesWindow(TempJJContinuousWindow):
         for target in parse_targets(run.measurement_settings["targets"]):
             if run.stop_event.is_set():
                 break
+            if not run.check_temperature_guard_setpoint(target["target"]):
+                break
             self.app.cryo.start_target(
                 target["target"], target["ramp"], target["pre_regen"], run.snapshot["general"]["fast_cooldown"],
                 run.stop_event, self.set_status
             )
             self.app.cryo.wait_for_target(
-                target["target"], 0.05, run.stop_event, run.skip_temperature_event, self.set_status, None, 0.25
+                target["target"],
+                0.05,
+                run.stop_event,
+                run.skip_temperature_event,
+                self.set_status,
+                None,
+                0.25,
             )
             for smu_name in active_smu_names(run.snapshot):
                 dev = self.app.hardware.get_smu(smu_name)
@@ -2427,6 +2649,9 @@ def try_tsp_parallel_dual_point(
     requests: Sequence[Tuple[str, SMUDevice, str, float]],
     settle_s: float,
 ) -> bool:
+    if not run.check_temperature_guard():
+        return True
+    pause_count = run.temperature_guard_pause_count
     if len(requests) != 2:
         return False
     (_, dev1, _, _), (_, dev2, _, _) = requests
@@ -2447,6 +2672,10 @@ def try_tsp_parallel_dual_point(
     if values is None:
         return False
     temp = run.app.hardware.read_temperature()
+    if not run.check_temperature_guard(temp):
+        return True
+    if run.temperature_guard_pause_count != pause_count:
+        return False
     for idx, (smu_name, _dev, _mode, level) in enumerate(requests):
         voltage = values[2 * idx]
         current = values[2 * idx + 1]
@@ -2467,9 +2696,13 @@ def execute_sweep_plans(
             execute_one_smu_plan(app, run, smu_name, plans.get(smu_name, []), settle_s)
     else:
         max_len = max((len(v) for v in plans.values()), default=0)
-        for idx in range(max_len):
+        idx = 0
+        while idx < max_len:
             if run.stop_event.is_set():
                 return
+            if not run.check_temperature_guard():
+                return
+            pause_count = run.temperature_guard_pause_count
             to_measure: List[Tuple[str, SMUDevice, str, float]] = []
             for smu_name in ("SMU1", "SMU2"):
                 levels = plans.get(smu_name, [])
@@ -2484,14 +2717,21 @@ def execute_sweep_plans(
                 level = levels[idx % len(levels)] if repeat_shorter else levels[idx]
                 to_measure.append((smu_name, dev, mode, level))
             if try_tsp_parallel_dual_point(run, to_measure, settle_s):
+                idx += 1
                 continue
+            pause_count = run.temperature_guard_pause_count
             for _smu_name, dev, mode, level in to_measure:
                 dev.apply_source(mode, level)
             time.sleep(settle_s)
             temp = app.hardware.read_temperature()
+            if not run.check_temperature_guard(temp):
+                return
+            if run.temperature_guard_pause_count != pause_count:
+                continue
             for smu_name, dev, mode, level in to_measure:
                 voltage, current = dev.measure(mode, level)
                 run.add_point(smu_name, voltage, current, temp, extra={"source_level": level})
+            idx += 1
 
 
 def execute_one_smu_plan(app: "MeasurementApp", run: MeasurementRun, smu_name: str, levels: List[float], settle_s: float) -> None:
@@ -2501,14 +2741,24 @@ def execute_one_smu_plan(app: "MeasurementApp", run: MeasurementRun, smu_name: s
     if not dev:
         return
     mode = run.snapshot["smu"][smu_name]["source_mode"]
-    for level in levels:
+    idx = 0
+    while idx < len(levels):
+        level = levels[idx]
         if run.stop_event.is_set():
             return
+        if not run.check_temperature_guard():
+            return
+        pause_count = run.temperature_guard_pause_count
         dev.apply_source(mode, level)
         time.sleep(settle_s)
         temp = app.hardware.read_temperature()
+        if not run.check_temperature_guard(temp):
+            return
+        if run.temperature_guard_pause_count != pause_count:
+            continue
         voltage, current = dev.measure(mode, level)
         run.add_point(smu_name, voltage, current, temp, extra={"source_level": level})
+        idx += 1
 
 
 def jj_params(settings: Dict[str, Any]) -> Dict[str, Any]:
@@ -2675,9 +2925,30 @@ def jj_apply_measure(
     coil_device: Optional[SMUDevice] = None,
     magnetic_field: Optional[float] = None,
 ) -> Dict[str, Any]:
-    dev.apply_source(SOURCE_CURRENT, current_A)
-    time.sleep(settle_s)
-    temp = run.app.hardware.read_temperature()
+    guard_row = {
+        "time": now_text(),
+        "elapsed_s": time.time() - run.start_time,
+        "smu": smu_name,
+        "voltage": float("nan"),
+        "current": float("nan"),
+        "temperature": run.app.hardware.read_temperature(),
+        "magnetic_field": magnetic_field if magnetic_field is not None else float("nan"),
+        "jj_current_set": current_A,
+    }
+    if not run.check_temperature_guard(guard_row["temperature"]):
+        return guard_row
+    while not run.stop_event.is_set():
+        pause_count = run.temperature_guard_pause_count
+        dev.apply_source(SOURCE_CURRENT, current_A)
+        time.sleep(settle_s)
+        temp = run.app.hardware.read_temperature()
+        if not run.check_temperature_guard(temp):
+            guard_row["temperature"] = temp
+            return guard_row
+        if run.temperature_guard_pause_count == pause_count:
+            break
+    else:
+        return guard_row
     voltage, current = dev.measure(SOURCE_CURRENT, current_A)
     if coil_device is not None:
         coil_v, coil_i = coil_device.measure(SOURCE_CURRENT, None)
@@ -2766,6 +3037,26 @@ class GeneralSettingsWindow:
             lambda _: self.save_to_state(),
         )
         self.jitter_seg.grid(row=0, column=5, padx=10, sticky="w")
+        self.temperature_guard_seg = SegmentedControl(
+            other,
+            [("Temp Guard Off", "0"), ("Temp Guard On", "1")],
+            "0",
+            lambda _: self.save_to_state(),
+        )
+        self.temperature_guard_seg.grid(row=1, column=0, columnspan=2, padx=4, pady=4, sticky="w")
+        ttk.Label(other, text="Min [K]").grid(row=1, column=2, padx=(12, 3), sticky="e")
+        self.temperature_guard_min = ttk.Entry(other, width=10)
+        self.temperature_guard_min.grid(row=1, column=3, sticky="w")
+        ttk.Label(other, text="Max [K]").grid(row=1, column=4, padx=(12, 3), sticky="e")
+        self.temperature_guard_max = ttk.Entry(other, width=10)
+        self.temperature_guard_max.grid(row=1, column=5, sticky="w")
+        self.temperature_guard_mode_seg = SegmentedControl(
+            other,
+            [("Save and stop", TEMP_GUARD_SAVE_STOP), ("Wait and continue", TEMP_GUARD_WAIT_CONTINUE)],
+            TEMP_GUARD_SAVE_STOP,
+            lambda _: self.save_to_state(),
+        )
+        self.temperature_guard_mode_seg.grid(row=2, column=0, columnspan=4, padx=4, pady=(0, 4), sticky="w")
 
         ranges = ttk.LabelFrame(main, text="Autorange and Manual Ranges")
         ranges.pack(fill=tk.X, pady=6)
@@ -2819,6 +3110,8 @@ class GeneralSettingsWindow:
             self.voltage_range_smu2,
             self.current_range_smu1,
             self.current_range_smu2,
+            self.temperature_guard_min,
+            self.temperature_guard_max,
         ):
             ent.bind("<FocusOut>", lambda _e: self.save_to_state())
             ent.bind("<Return>", lambda _e: self.save_to_state())
@@ -2855,6 +3148,8 @@ class GeneralSettingsWindow:
         self.header_seg.set("1" if cfg.put_header else "0")
         self.fast_cool_seg.set("1" if cfg.fast_cooldown else "0")
         self.jitter_seg.set("1" if cfg.jitter else "0")
+        self.temperature_guard_seg.set("1" if cfg.temperature_guard_enabled else "0")
+        self.temperature_guard_mode_seg.set(cfg.temperature_guard_mode)
         self.autorange_voltage_seg.set("1" if cfg.autorange_voltage else "0")
         self.autorange_current_seg.set("1" if cfg.autorange_current else "0")
         self.autozero_seg.set(cfg.autozero)
@@ -2865,6 +3160,8 @@ class GeneralSettingsWindow:
         self._set_entry(self.voltage_range_smu2, cfg.voltage_range_smu2_mV)
         self._set_entry(self.current_range_smu1, cfg.current_range_smu1_uA)
         self._set_entry(self.current_range_smu2, cfg.current_range_smu2_uA)
+        self._set_entry(self.temperature_guard_min, cfg.temperature_guard_min_K)
+        self._set_entry(self.temperature_guard_max, cfg.temperature_guard_max_K)
         self.save_path_label.configure(text=cfg.save_path)
         self.loading = False
 
@@ -2888,6 +3185,8 @@ class GeneralSettingsWindow:
         cfg.put_header = self.header_seg.get() == "1"
         cfg.fast_cooldown = self.fast_cool_seg.get() == "1"
         cfg.jitter = self.jitter_seg.get() == "1"
+        cfg.temperature_guard_enabled = self.temperature_guard_seg.get() == "1"
+        cfg.temperature_guard_mode = self.temperature_guard_mode_seg.get()
         cfg.autorange_voltage = self.autorange_voltage_seg.get() == "1"
         cfg.autorange_current = self.autorange_current_seg.get() == "1"
         cfg.autozero = self.autozero_seg.get()
@@ -2899,6 +3198,8 @@ class GeneralSettingsWindow:
             cfg.voltage_range_smu2_mV = parse_optional_float(self.voltage_range_smu2.get())
             cfg.current_range_smu1_uA = parse_optional_float(self.current_range_smu1.get())
             cfg.current_range_smu2_uA = parse_optional_float(self.current_range_smu2.get())
+            cfg.temperature_guard_min_K = parse_optional_float(self.temperature_guard_min.get())
+            cfg.temperature_guard_max_K = parse_optional_float(self.temperature_guard_max.get())
         except ValueError:
             return
         self.app.state.save()
@@ -3008,6 +3309,10 @@ class MeasurementApp:
                 "save_path": cfg.save_path,
                 "backup_path": cfg.backup_path,
                 "fast_cooldown": cfg.fast_cooldown,
+                "temperature_guard_enabled": cfg.temperature_guard_enabled,
+                "temperature_guard_mode": cfg.temperature_guard_mode,
+                "temperature_guard_min_K": cfg.temperature_guard_min_K,
+                "temperature_guard_max_K": cfg.temperature_guard_max_K,
             },
             "smu": {"SMU1": asdict(cfg.smu1), "SMU2": asdict(cfg.smu2)},
         }
